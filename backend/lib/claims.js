@@ -148,6 +148,53 @@ async function insertDraftClaim(q, opts) {
   return claim;
 }
 
+// Insert a REPLACEMENT (CMS frequency 7) draft claim for the claim being replaced,
+// plus its 'created' claim_events row, and return the new claim row. Must run inside
+// a transaction (`q` = pg client) so the claim and its event commit together.
+//
+// The replacement is a NEW claim on the SAME session (claims already allow multiple
+// per session for resubmission/appeal), copying the original's session/client/
+// clinician/insurance links and billed amount, and carrying the durable replacement
+// intent: submission_frequency_code '7', the payer's original claim control number,
+// and corrects_claim_id pointing at the original. It starts as a draft — the
+// operator reviews and submits it through the normal submit path (which emits
+// frequency 7 and runs the safety gate). The billable fields are COPIED so the
+// original stays untouched (its lineage is preserved via the FK).
+async function insertReplacementClaim(q, opts) {
+  const original = opts.original;
+  const ins = await q.query(
+    `insert into claims
+       (practice_id, session_id, client_id, clinician_id, insurance_record_id,
+        claim_number, status, billed_amount,
+        submission_frequency_code, payer_claim_control_number, corrects_claim_id)
+     values ($1, $2, $3, $4, $5, $6, 'draft', $7, '7', $8, $9)
+     returning *`,
+    [
+      opts.practiceId,
+      original.session_id,
+      original.client_id,
+      original.clinician_id,
+      original.insurance_record_id != null ? original.insurance_record_id : null,
+      original.claim_number != null ? original.claim_number : null,
+      original.billed_amount != null ? original.billed_amount : null,
+      opts.payerClaimControlNumber,
+      original.id,
+    ]
+  );
+  const claim = ins.rows[0];
+  await logClaimEvent(q, {
+    practiceId: opts.practiceId,
+    claimId: claim.id,
+    createdBy: opts.createdBy || null,
+    eventType: 'created',
+    statusTo: 'draft',
+    // Non-PHI note: names the lineage by short id, never the payer claim number
+    // (which the operator entered and which we keep off the human-readable note).
+    note: 'Replacement claim created for claim #' + String(original.id).slice(0, 8) + '.',
+  });
+  return claim;
+}
+
 module.exports = {
   generatePatientControlNumber,
   ensurePatientControlNumber,
@@ -156,4 +203,5 @@ module.exports = {
   logClaimEvent,
   logClaimAcknowledgment,
   insertDraftClaim,
+  insertReplacementClaim,
 };

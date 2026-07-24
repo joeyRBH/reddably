@@ -457,6 +457,10 @@ create table if not exists claims (
   claim_number           text,
   control_number         text,
   patient_control_number varchar(20),                         -- 837P CLM01 (<=20 chars); echoed in 277CA/835 for matching
+  submission_frequency_code text                              -- frequency actually submitted: '1' original / '7' replacement (NULL until submitted)
+                           check (submission_frequency_code is null or submission_frequency_code in ('1', '7')),
+  payer_claim_control_number text,                            -- replacement (freq 7): payer's ORIGINAL claim number → 837P claim-level REF*F8
+  corrects_claim_id      uuid references claims (id) on delete restrict,  -- self-ref: the claim this one replaces
   clearinghouse          text,                                -- e.g. office_ally
   status                 text not null default 'draft'
                            check (status in ('draft', 'submitted', 'processing', 'info_requested',
@@ -499,6 +503,36 @@ alter table claims add column if not exists patient_control_number varchar(20);
 create unique index if not exists idx_claims_patient_control_number
   on claims (patient_control_number)
   where patient_control_number is not null;
+
+-- Migration (idempotent): replacement-claim (CMS frequency 7) durable submission
+-- intent — the frequency actually submitted, the payer's original claim number
+-- being replaced (→ 837P claim-level REF*F8), and a self-reference to the claim
+-- being replaced. Frequency 7 ONLY; void (8) is a separate later change. See
+-- db/migrations/018_add_replacement_claim_fields_to_claims.sql.
+alter table claims add column if not exists submission_frequency_code text;
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'claims_submission_frequency_code_check'
+  ) then
+    alter table claims
+      add constraint claims_submission_frequency_code_check
+      check (submission_frequency_code is null or submission_frequency_code in ('1', '7'));
+  end if;
+end $$;
+alter table claims add column if not exists payer_claim_control_number text;
+alter table claims add column if not exists corrects_claim_id uuid;
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'claims_corrects_claim_id_fkey'
+  ) then
+    alter table claims
+      add constraint claims_corrects_claim_id_fkey
+      foreign key (corrects_claim_id) references claims (id) on delete restrict;
+  end if;
+end $$;
+create index if not exists idx_claims_corrects_claim_id on claims (corrects_claim_id);
 
 -- =============================================================================
 -- 9. claim_events — status-history log per claim.

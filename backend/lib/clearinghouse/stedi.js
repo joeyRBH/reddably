@@ -379,6 +379,41 @@ function buildProviderLoops(ctx) {
   return { billing, rendering: null, billingNpi };
 }
 
+// -----------------------------------------------------------------------------
+// Claim frequency (837P CLM05-3 / CMS-1500 Box 22) — '1' original, '7' replacement.
+//
+// A replacement claim asks the payer to REPLACE a claim it previously accepted.
+// It MUST carry the payer's ORIGINAL claim control number so the payer replaces
+// that specific claim; the clearinghouse translates it to the claim-level REF*F8
+// segment. Omitting it (or sending frequency 7 as a new original) makes the payer
+// treat the resubmission as a DUPLICATE and reject it.
+//
+// The frequency is read from the claim's DURABLE submission_frequency_code
+// (persisted by the submit handler / the /replace flow, not transient request
+// input). Anything other than '7' is an original '1'. Void (frequency 8) is a
+// separate, later capability and is intentionally NOT produced here.
+// -----------------------------------------------------------------------------
+const CLAIM_FREQUENCY_ORIGINAL = '1';
+const CLAIM_FREQUENCY_REPLACEMENT = '7';
+
+// Replacement intent is read from the durable frequency code OR a reference to the
+// claim being replaced. Keying on BOTH (not just the code) means a row that carries
+// corrects_claim_id can never slip through the builder as a new original '1' — it
+// is built as frequency 7 and REQUIRES the payer claim number (throwing if absent),
+// exactly matching the submit handler's gate so the two can never disagree.
+function isReplacementClaim(claim) {
+  return String((claim && claim.submission_frequency_code) || '').trim() === CLAIM_FREQUENCY_REPLACEMENT ||
+    (claim != null && claim.corrects_claim_id != null);
+}
+
+// The payer's original claim control number to send on a replacement (REF*F8 /
+// claimControlNumber). Trim only — payer-assigned ICN/DCN values vary in format and
+// length across payers, and REF02 tolerates up to 50 chars, so we do NOT strip
+// characters or truncate the way the 20-char CLM01 patient control number is bounded.
+function replacementReferenceNumber(claim) {
+  return cleanStr(claim && claim.payer_claim_control_number);
+}
+
 // Build the 837P submission request body from the claim context. Pure (no network)
 // so it can be unit-tested; submitClaim() POSTs whatever this returns.
 function buildSubmissionBody(ctx) {
@@ -473,6 +508,36 @@ function buildSubmissionBody(ctx) {
         professionalService,
       },
     ];
+  }
+
+  // Replacement claim (CMS frequency 7): override the default original ('1') and
+  // attach the payer's ORIGINAL claim control number so the payer REPLACES that
+  // claim instead of rejecting this as a duplicate original. The reference goes on
+  // the child key claimControlNumber inside claimInformation.claimSupplementalInformation
+  // (claimSupplementalInformation is a confirmed-valid object; the child key name
+  // MUST be confirmed against Stedi's live schema via the negative-control probe —
+  // a silently-wrong name here sends the replacement out as a duplicate original).
+  // The clearinghouse translates this to the claim-level REF*F8 segment.
+  //
+  // We REFUSE to build a frequency-7 body without the reference rather than quietly
+  // falling back to '1' — the submit handler's safety gate rejects this case first
+  // with a clean error, but the builder is the last line of defense for any direct
+  // adapter caller. Ordinary claims never enter this branch, so their body stays
+  // byte-identical (claimFrequencyCode '1', no claimSupplementalInformation).
+  if (isReplacementClaim(claim)) {
+    const payerRef = replacementReferenceNumber(claim);
+    if (!payerRef) {
+      throw new Error(
+        'Replacement claim (frequency 7) requires the payer claim control number ' +
+        '(claimInformation.claimSupplementalInformation.claimControlNumber). Refusing to ' +
+        'send as a new original, which the payer would reject as a duplicate.'
+      );
+    }
+    claimInformation.claimFrequencyCode = CLAIM_FREQUENCY_REPLACEMENT;
+    claimInformation.claimSupplementalInformation = {
+      ...(claimInformation.claimSupplementalInformation || {}),
+      claimControlNumber: payerRef,
+    };
   }
 
   // Dependent mode: when the insurance record names a subscriber relationship
@@ -1227,4 +1292,5 @@ module.exports = {
   boundControlNumber,
   resolveUsageIndicator,
   testSubmissionsAllowed,
+  isReplacementClaim,
 };

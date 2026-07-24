@@ -336,7 +336,15 @@
       return request('POST', '/claims/' + id + '/submit', payload).then(function (res) {
         // Only charge the platform fee when the claim was actually submitted —
         // never on the warning gate. Best-effort via Vercel; never blocks submit.
-        if (!res || !res.requires_confirmation) chargeClaimFee(id);
+        //
+        // A REPLACEMENT (frequency 7) claim NEVER charges the fee: it supersedes a
+        // claim on which the fee was already collected, so charging again would bill
+        // the patient another 5% for the same service. Skip the call here (the
+        // Lambda charge-fee/context also refuses it, so this is defense in depth).
+        var claim = res && res.claim;
+        var isReplacement = !!claim &&
+          (claim.submission_frequency_code === '7' || claim.corrects_claim_id != null);
+        if (!res || (!res.requires_confirmation && !isReplacement)) chargeClaimFee(id);
         return res;
       });
     },
@@ -346,6 +354,11 @@
     // after its underlying session was edited. Server-side; no client-side math.
     regenerate: function (id) { return request('POST', '/claims/' + id + '/regenerate', {}); },
     events: function (id) { return request('GET', '/claims/' + id + '/events'); },
+    // Create a CMS frequency-7 REPLACEMENT of an accepted claim. `id` is the
+    // original (payer-accepted) claim; returns a NEW draft claim carrying the
+    // replacement intent, which the operator then submits (with a confirm dialog).
+    // payload: { payer_claim_control_number } — the payer's original claim number.
+    replace: function (id, payload) { return request('POST', '/claims/' + id + '/replace', payload); },
   };
 
   var users = {

@@ -69,3 +69,11 @@ done
   telehealth). Optional and payer-specific; validated + normalized by
   `backend/handlers/sessions.js` and attached to the service line by
   `backend/lib/clearinghouse/stedi.js`. `NULL` when a session carries none.
+- `018_add_replacement_claim_fields_to_claims.sql` — adds `submission_frequency_code`
+  (`'1'` original / `'7'` replacement, `NULL` until submitted), `payer_claim_control_number`
+  (the payer's original claim number a replacement replaces → 837P claim-level `REF*F8`),
+  and `corrects_claim_id` (self-ref to the replaced claim) to `claims`. Powers CMS
+  frequency-7 replacement claims: `POST /claims/{id}/replace` mints a replacement draft,
+  the submit handler enforces the safety gate, and `backend/lib/clearinghouse/stedi.js`
+  emits `claimFrequencyCode '7'` + `claimSupplementalInformation.claimControlNumber`.
+  Frequency 7 ONLY — void (`8`) is a separate later change.
