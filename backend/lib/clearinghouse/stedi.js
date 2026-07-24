@@ -242,6 +242,34 @@ function normalizeDiagnosisCodes(codes) {
   return out;
 }
 
+// Service-line procedure-modifier cardinality. The 837P professional service
+// (SV101) carries up to FOUR modifiers (SV101-3..SV101-6), mirroring CMS-1500
+// Box 24D. Backend validation (handlers/sessions.js) already enforces this, but
+// the builder re-caps defensively for direct adapter callers.
+const MAX_LINE_PROCEDURE_MODIFIERS = 4;
+
+// Normalize stored procedure modifiers for the wire: trim, uppercase, keep only
+// codes that are exactly two alphanumeric characters, de-duplicate while preserving
+// stored order, and cap at four. This is the ACCEPTED shape of parseProcedureModifiers()
+// in backend/handlers/sessions.js — restated here rather than imported because the
+// Lambda bundle ships backend/ only. The handler is the strict gatekeeper (a malformed
+// code makes it reject the whole write with a 400); the builder is defensive and simply
+// drops anything malformed rather than failing a submission, so what it emits is always
+// a subset of what the handler would have persisted. A non-array (or all-blank) input
+// yields [] so the caller omits the field entirely.
+function normalizeProcedureModifiers(mods) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(mods) ? mods : []) {
+    const code = String(raw == null ? '' : raw).trim().toUpperCase();
+    if (!/^[A-Z0-9]{2}$/.test(code) || seen.has(code)) continue;
+    seen.add(code);
+    out.push(code);
+    if (out.length >= MAX_LINE_PROCEDURE_MODIFIERS) break;
+  }
+  return out;
+}
+
 // Trim a stored text field to a non-empty string, else ''. Used for the optional
 // fields that must be ABSENT (not '' / null) from the built body when unset.
 function cleanStr(v) {
@@ -415,22 +443,34 @@ function buildSubmissionBody(ctx) {
       MAX_LINE_DIAGNOSIS_POINTERS
     );
     const lineDiagnosisPointers = Array.from({ length: pointerCount }, (_, i) => String(i + 1));
+    const professionalService = {
+      procedureIdentifier: 'HC',
+      procedureCode: session.cpt_code,
+      lineItemChargeAmount: claim.billed_amount != null ? String(claim.billed_amount) : undefined,
+      measurementUnit: 'UN',     // units of service
+      serviceUnitCount: '1',     // one unit per claim line (standard for OON psychotherapy CPT codes)
+      // Point this line at the first N diagnoses declared above, in stored
+      // order, 1-indexed. N is capped by the LINE limit (4), which is smaller
+      // than the claim limit (12) — emitting one pointer per claim diagnosis
+      // would overflow SV107. With no stored diagnoses this is ['1'], the
+      // placeholder principal.
+      compositeDiagnosisCodePointers: { diagnosisCodePointers: lineDiagnosisPointers },
+    };
+
+    // Procedure modifiers (Box 24D / SV101-3..6) — e.g. 95 for synchronous
+    // telehealth, paired with the telehealth place of service above. The session
+    // decides; omit the field ENTIRELY when there are none (never '' / null / []).
+    // procedureModifiers is an array of strings on professionalService, confirmed
+    // against Stedi's live schema via the negative-control probe (see the PR).
+    const procedureModifiers = normalizeProcedureModifiers(session.procedure_modifiers);
+    if (procedureModifiers.length) {
+      professionalService.procedureModifiers = procedureModifiers;
+    }
+
     claimInformation.serviceLines = [
       {
         serviceDate: ymd(session.session_date) || undefined,
-        professionalService: {
-          procedureIdentifier: 'HC',
-          procedureCode: session.cpt_code,
-          lineItemChargeAmount: claim.billed_amount != null ? String(claim.billed_amount) : undefined,
-          measurementUnit: 'UN',     // units of service
-          serviceUnitCount: '1',     // one unit per claim line (standard for OON psychotherapy CPT codes)
-          // Point this line at the first N diagnoses declared above, in stored
-          // order, 1-indexed. N is capped by the LINE limit (4), which is smaller
-          // than the claim limit (12) — emitting one pointer per claim diagnosis
-          // would overflow SV107. With no stored diagnoses this is ['1'], the
-          // placeholder principal.
-          compositeDiagnosisCodePointers: { diagnosisCodePointers: lineDiagnosisPointers },
-        },
+        professionalService,
       },
     ];
   }

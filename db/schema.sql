@@ -406,6 +406,7 @@ create table if not exists sessions (
   cpt_code         text,
   diagnosis_codes  text[],                                    -- ICD-10 codes
   place_of_service text,
+  procedure_modifiers text[],                                 -- CMS-1500 Box 24D (e.g. 95 = synchronous telehealth)
   fee              numeric(12,2),
   notes            text,                                      -- billing notes only — no clinical notes
   status           text not null default 'scheduled'
@@ -437,6 +438,11 @@ create index if not exists idx_sessions_is_hidden on sessions (is_hidden);
 -- See db/migrations/005_add_recurrence_group_to_sessions.sql.
 alter table sessions add column if not exists recurrence_group_id uuid;
 create index if not exists idx_sessions_recurrence_group_id on sessions (recurrence_group_id);
+
+-- Migration (idempotent): add procedure modifiers to the live sessions table.
+-- Payer-required CMS-1500 Box 24D modifiers on the service line (e.g. 95 for
+-- synchronous telehealth). See db/migrations/017_add_procedure_modifiers_to_sessions.sql.
+alter table sessions add column if not exists procedure_modifiers text[];
 
 -- =============================================================================
 -- 8. claims — OON claim records (multiple allowed per session for resubmit/appeal).

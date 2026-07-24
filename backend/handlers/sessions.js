@@ -46,6 +46,10 @@ const RECURRENCE_CADENCES = ['none', 'weekly', 'biweekly'];
 const RECURRENCE_MAX_MONTHS = 6;
 
 const MAX_DIAGNOSIS_CODES = 12; // CMS-1500 allows up to 12 ICD-10 codes.
+const MAX_PROCEDURE_MODIFIERS = 4; // CMS-1500 Box 24D holds up to 4 modifiers per line.
+
+// A procedure modifier (post-normalization) is exactly two alphanumeric characters.
+const MODIFIER_RE = /^[A-Z0-9]{2}$/;
 
 // --- request helpers ---------------------------------------------------------
 
@@ -123,6 +127,33 @@ function parseDiagnosisCodes(v) {
   return { ok: true, value: out.length === 0 ? null : out };
 }
 
+// Optional procedure modifiers (CMS-1500 Box 24D / 837P service line): absent/null
+// → null; otherwise must be an array. Each entry is trimmed and uppercased; blanks
+// are dropped; every surviving entry must be exactly two alphanumeric characters
+// (anything else is a hard 400, not a silent drop). The cleaned list is
+// de-duplicated preserving first-seen order and capped at MAX_PROCEDURE_MODIFIERS —
+// more than four DISTINCT modifiers is a 400, never a truncation. An empty / all-
+// blank array clears the column (stored as null). This normalization is mirrored by
+// normalizeProcedureModifiers() in lib/clearinghouse/stedi.js so what is validated
+// here is exactly what rides the 837P.
+function parseProcedureModifiers(v) {
+  if (v == null) return { ok: true, value: null };
+  if (!Array.isArray(v)) return { ok: false };
+  const out = [];
+  const seen = new Set();
+  for (const item of v) {
+    if (typeof item !== 'string') return { ok: false };
+    const code = item.trim().toUpperCase();
+    if (code === '') continue;                  // drop blanks
+    if (!MODIFIER_RE.test(code)) return { ok: false };
+    if (seen.has(code)) continue;               // de-duplicate, preserve order
+    seen.add(code);
+    out.push(code);
+  }
+  if (out.length > MAX_PROCEDURE_MODIFIERS) return { ok: false };
+  return { ok: true, value: out.length === 0 ? null : out };
+}
+
 // --- shaping -----------------------------------------------------------------
 
 function shapeSession(r) {
@@ -137,6 +168,7 @@ function shapeSession(r) {
     cpt_code: r.cpt_code,
     diagnosis_codes: r.diagnosis_codes,
     place_of_service: r.place_of_service,
+    procedure_modifiers: r.procedure_modifiers,
     fee: r.fee,
     notes: r.notes,
     status: r.status,
@@ -218,6 +250,10 @@ async function createSession(practiceId, body, event, authCtx) {
   if (!dx.ok) {
     return json(400, { error: 'Invalid diagnosis_codes. Expected an array of up to 12 non-empty strings.' }, event);
   }
+  const modifiers = parseProcedureModifiers(body.procedure_modifiers);
+  if (!modifiers.ok) {
+    return json(400, { error: 'Invalid procedure_modifiers. Expected an array of up to 4 two-character alphanumeric codes.' }, event);
+  }
   const status = parseStatus(body.status);
   if (!status.ok) {
     return json(400, { error: `Invalid status. Expected one of: ${SESSION_STATUSES.join(', ')}.` }, event);
@@ -241,8 +277,8 @@ async function createSession(practiceId, body, event, authCtx) {
     const res = await db.query(
       `insert into sessions
          (practice_id, client_id, clinician_id, session_date, duration_minutes,
-          cpt_code, diagnosis_codes, place_of_service, fee, notes, status)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, coalesce($11, 'scheduled'))
+          cpt_code, diagnosis_codes, place_of_service, procedure_modifiers, fee, notes, status)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, coalesce($12, 'scheduled'))
        returning *`,
       [
         practiceId,
@@ -253,6 +289,7 @@ async function createSession(practiceId, body, event, authCtx) {
         cptCode,
         dx.value,
         placeOfService,
+        modifiers.value,
         fee.value,
         notes,
         status.value,
@@ -293,9 +330,9 @@ async function createSession(practiceId, body, event, authCtx) {
       const res = await client.query(
         `insert into sessions
            (practice_id, client_id, clinician_id, session_date, duration_minutes,
-            cpt_code, diagnosis_codes, place_of_service, fee, notes, status,
+            cpt_code, diagnosis_codes, place_of_service, procedure_modifiers, fee, notes, status,
             recurrence_group_id)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, coalesce($11, 'scheduled'), $12)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, coalesce($12, 'scheduled'), $13)
          returning *`,
         [
           practiceId,
@@ -306,6 +343,7 @@ async function createSession(practiceId, body, event, authCtx) {
           cptCode,
           dx.value,
           placeOfService,
+          modifiers.value,
           fee.value,
           notes,
           rowStatus,
@@ -465,6 +503,14 @@ async function updateSession(practiceId, userId, id, body, event, authCtx) {
       return json(400, { error: 'Invalid diagnosis_codes. Expected an array of up to 12 non-empty strings.' }, event);
     }
     add('diagnosis_codes', dx.value);
+  }
+
+  if ('procedure_modifiers' in body) {
+    const modifiers = parseProcedureModifiers(body.procedure_modifiers);
+    if (!modifiers.ok) {
+      return json(400, { error: 'Invalid procedure_modifiers. Expected an array of up to 4 two-character alphanumeric codes.' }, event);
+    }
+    add('procedure_modifiers', modifiers.value);
   }
 
   if ('fee' in body) {
