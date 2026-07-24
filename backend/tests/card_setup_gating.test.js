@@ -104,21 +104,41 @@ dbLib.query = async (text, params) => {
   }
 
   if (/update insurance_records set/.test(t)) {
-    const [carrier, member, , , , , payerId] = params;
+    // Param layout (save-insurance UPDATE): $1 carrier, $2 member, $3 group,
+    // $4 relationship, $5 subscriberIsSelf, $6 name, $7 dob, $8 gender,
+    // $9-13 address lines, $14 payer_id, $15 id. (Policyholder demographics were
+    // added; payer_id shifted from $7 to $14.)
+    const [carrier, member, , relationship, isSelf, name, dob, gender, a1, a2, city, st, zip, payerId] = params;
     const r = state.insurance;
     if (notBlank(carrier)) r.carrier_name = carrier;
     if (notBlank(member)) r.member_id = member;
+    if (notBlank(relationship)) r.subscriber_relationship = relationship;
+    // Mirror the SQL `case when $5 then null else coalesce(nullif($n,''), col)`:
+    // a self-flip ($5 true) clears every policyholder column; a dependent update
+    // coalesces (a blank incoming value keeps the existing one).
+    const setOrClear = (cur, incoming) => (isSelf ? null : (notBlank(incoming) ? incoming : cur));
+    r.subscriber_name = setOrClear(r.subscriber_name, name);
+    r.subscriber_dob = setOrClear(r.subscriber_dob, dob);
+    r.subscriber_gender = setOrClear(r.subscriber_gender, gender);
+    r.subscriber_address_line1 = setOrClear(r.subscriber_address_line1, a1);
+    r.subscriber_address_line2 = setOrClear(r.subscriber_address_line2, a2);
+    r.subscriber_city = setOrClear(r.subscriber_city, city);
+    r.subscriber_state = setOrClear(r.subscriber_state, st);
+    r.subscriber_postal_code = setOrClear(r.subscriber_postal_code, zip);
     r.payer_id = payerId; // authoritative: the picked id, or null via the escape hatch
     return { rows: [], rowCount: 1 };
   }
 
   if (/insert into insurance_records/.test(t)) {
+    // Param layout (save-insurance INSERT): $1 practice_id, $2 client_id,
+    // $3 carrier, $4 member, $5 group, $6 relationship, $7 name, $8 dob,
+    // $9 gender, $10-14 address lines, $15 payer_id. (payer_id shifted from $9.)
     state.insurance = {
       id: 'ins_1',
       client_id: params[1],
       carrier_name: params[2],
       member_id: params[3],
-      payer_id: params[8],
+      payer_id: params[14],
       is_primary: true,
       is_hidden: false,
     };
@@ -315,6 +335,47 @@ test('an already-active client stays active and logs no spurious status change',
   assert.strictEqual(res.statusCode, 200);
   assert.strictEqual(state.client.status, 'active');
   assert.ok(!state.audits.some((a) => a.action === 'client.status_change'));
+});
+
+// --- 4. self-reset: flipping the relationship to self clears policyholder PHI --
+
+test('correcting the relationship to self wipes stale policyholder demographics', async () => {
+  // Start from a record that names a dependent policyholder with full demographics.
+  reset({ status: 'active' }, {
+    id: 'ins_1',
+    carrier_name: 'Surest',
+    member_id: 'W123456789',
+    payer_id: '60054',
+    subscriber_relationship: 'child',
+    subscriber_name: 'Pat Rivera',
+    subscriber_dob: '1965-02-10',
+    subscriber_gender: 'male',
+    subscriber_address_line1: '99 Holder Ave',
+    subscriber_address_line2: 'Unit 4',
+    subscriber_city: 'Boulder',
+    subscriber_state: 'CO',
+    subscriber_postal_code: '80301',
+  });
+
+  // The patient corrects themselves to "I am the policyholder" (self). The page
+  // then submits only the base insurance fields (relationship 'self').
+  const res = await call('save-insurance', Object.assign({ payer_id: '60054' }, INSURANCE));
+  assert.strictEqual(res.statusCode, 200);
+
+  const i = state.insurance;
+  assert.strictEqual(i.subscriber_relationship, 'self', 'relationship recorded as self');
+  for (const col of [
+    'subscriber_name', 'subscriber_dob', 'subscriber_gender',
+    'subscriber_address_line1', 'subscriber_address_line2',
+    'subscriber_city', 'subscriber_state', 'subscriber_postal_code',
+  ]) {
+    assert.strictEqual(i[col], null, col + ' must be cleared when relationship flips to self');
+  }
+  // The policy's own (non-policyholder) fields carry the submitted values and are
+  // unaffected by the self-reset.
+  assert.strictEqual(i.carrier_name, 'Aetna', 'carrier updated from the submitted body');
+  assert.strictEqual(i.member_id, 'W123456789', 'member id present');
+  assert.strictEqual(i.payer_id, '60054', 'payer id present');
 });
 
 // --- runner -----------------------------------------------------------------

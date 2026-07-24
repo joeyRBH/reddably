@@ -142,6 +142,9 @@ function shapeClaim(r) {
     submission_frequency_code: r.submission_frequency_code,
     payer_claim_control_number: r.payer_claim_control_number,
     corrects_claim_id: r.corrects_claim_id,
+    // Prior authorization number (CMS-1500 Box 23 / 837P claim-level REF*G1),
+    // captured at submit time and durable thereafter. Null on claims that carry none.
+    prior_authorization_number: r.prior_authorization_number,
     clearinghouse: r.clearinghouse,
     status: r.status,
     billed_amount: r.billed_amount,
@@ -714,6 +717,17 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   // 277/835 responses match back to this claim. Reused as-is if already set.
   claim.patient_control_number = await ensurePatientControlNumber(db, practiceId, claim);
 
+  // Prior authorization number (CMS-1500 Box 23 / 837P claim-level REF*G1) is
+  // captured in the submit flow and copied into the immutable submission context
+  // (the durable claims row written below), mirroring how the replacement
+  // frequency is captured. A value on THIS request wins; otherwise the value the
+  // claim already carries is reused, so it stays stable across resubmissions.
+  // Set on `claim` BEFORE buildClaimContext so the builder emits it this submission
+  // (buildClaimContext passes `claim` straight through into ctx). Absent → null,
+  // and the builder omits the field entirely.
+  const priorAuthInput = cleanText(body && body.prior_authorization_number);
+  claim.prior_authorization_number = priorAuthInput || cleanText(claim.prior_authorization_number) || null;
+
   const ctx = await buildClaimContext(practiceId, claim);
 
   // Block submission before it reaches the clearinghouse if the practice has no
@@ -874,8 +888,9 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
               claim_number = coalesce(claim_number, $2),
               clearinghouse = $3,
               clearinghouse_payload = $4,
-              submission_frequency_code = $5
-        where id = $6 and practice_id = $7 and is_hidden = false and status = 'draft'
+              submission_frequency_code = $5,
+              prior_authorization_number = $6
+        where id = $7 and practice_id = $8 and is_hidden = false and status = 'draft'
         returning *`,
       [
         cleanText(result.control_number),
@@ -883,6 +898,7 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
         adapter.name,
         result.raw != null ? JSON.stringify(result.raw) : null,
         submittedFrequency,
+        cleanText(claim.prior_authorization_number),
         id,
         practiceId,
       ]

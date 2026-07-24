@@ -434,6 +434,52 @@
               <label for="ins-holder-dob">Policyholder date of birth</label>
               <input id="ins-holder-dob" class="input" type="date">
             </div>
+            <div class="field">
+              <label for="ins-holder-gender">Policyholder sex on the policy <span aria-hidden="true">(optional)</span></label>
+              <select id="ins-holder-gender" class="input">
+                <option value="">Prefer not to say</option>
+                <option value="female">Female</option>
+                <option value="male">Male</option>
+                <option value="unknown">Unknown</option>
+              </select>
+              <p class="field-help">Some insurance plans need the policyholder's sex to process the claim.</p>
+            </div>
+
+            <!-- Policyholder address (CMS-1500 Box 7). This is the POLICYHOLDER's
+                 address — it may differ from the patient's own address entered
+                 earlier. The checkbox copies the patient's address as a shortcut. -->
+            <p class="field-help" style="margin-bottom:var(--space-2)">Policyholder's mailing address <span aria-hidden="true">(optional)</span> — this may be different from the patient's address.</p>
+            <div class="field">
+              <label class="checkbox-row" for="ins-holder-same-addr" style="display:flex;align-items:center;gap:var(--space-2);cursor:pointer">
+                <input id="ins-holder-same-addr" type="checkbox">
+                <span>Same as the patient's address</span>
+              </label>
+            </div>
+            <div class="field">
+              <label for="ins-holder-address1">Policyholder address line 1</label>
+              <input id="ins-holder-address1" class="input" type="text" autocomplete="off"
+                     maxlength="200" placeholder="Street address">
+            </div>
+            <div class="field">
+              <label for="ins-holder-address2">Policyholder address line 2 <span aria-hidden="true">(optional)</span></label>
+              <input id="ins-holder-address2" class="input" type="text" autocomplete="off"
+                     maxlength="200" placeholder="Apt, suite, unit">
+            </div>
+            <div class="field">
+              <label for="ins-holder-city">Policyholder city</label>
+              <input id="ins-holder-city" class="input" type="text" autocomplete="off"
+                     maxlength="200">
+            </div>
+            <div class="field">
+              <label for="ins-holder-state">Policyholder state</label>
+              <input id="ins-holder-state" class="input" type="text" autocomplete="off"
+                     maxlength="200" placeholder="e.g. CO">
+            </div>
+            <div class="field">
+              <label for="ins-holder-zip">Policyholder ZIP</label>
+              <input id="ins-holder-zip" class="input" type="text" autocomplete="off"
+                     maxlength="200">
+            </div>
           </div>
 
           <!-- Soft confirm shown when the patient's and policyholder's DOBs match.
@@ -930,9 +976,27 @@
           if (relationship.value !== 'self') {
             fields.subscriber_name = $('ins-holder-name').value.trim();
             fields.subscriber_dob = $('ins-holder-dob').value.trim();
+            fields.subscriber_gender = $('ins-holder-gender').value;
+            fields.subscriber_address_line1 = $('ins-holder-address1').value.trim();
+            fields.subscriber_address_line2 = $('ins-holder-address2').value.trim();
+            fields.subscriber_city = $('ins-holder-city').value.trim();
+            fields.subscriber_state = $('ins-holder-state').value.trim();
+            fields.subscriber_postal_code = $('ins-holder-zip').value.trim();
           }
           return fields;
         }
+
+        // "Same as the patient's address" convenience: copy the address the patient
+        // entered in the details step into the policyholder address inputs. Only a
+        // shortcut — the patient can still edit the copied values afterwards.
+        $('ins-holder-same-addr').addEventListener('change', function () {
+          if (!this.checked) return;
+          $('ins-holder-address1').value = ($('dt-address1').value || '').trim();
+          $('ins-holder-address2').value = ($('dt-address2').value || '').trim();
+          $('ins-holder-city').value = ($('dt-city').value || '').trim();
+          $('ins-holder-state').value = ($('dt-state').value || '').trim();
+          $('ins-holder-zip').value = ($('dt-zip').value || '').trim();
+        });
 
         $('insurance-form').addEventListener('submit', function (e) {
           e.preventDefault();

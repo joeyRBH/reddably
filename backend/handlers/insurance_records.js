@@ -101,6 +101,35 @@ function parsePayerId(v) {
   return { ok: true, value: s };
 }
 
+// Optional dependent-subscriber (policyholder) gender: absent/blank → null;
+// otherwise must be one of the stored vocabulary, matching both clients.gender and
+// the insurance_records_subscriber_gender_check DB constraint. Lower-cased so the
+// UI can send 'Female' etc. Returns { ok, value }.
+const SUBSCRIBER_GENDERS = new Set(['female', 'male', 'unknown']);
+function parseGender(v) {
+  if (v == null) return { ok: true, value: null };
+  const s = String(v).trim().toLowerCase();
+  if (s === '') return { ok: true, value: null };
+  if (!SUBSCRIBER_GENDERS.has(s)) return { ok: false };
+  return { ok: true, value: s };
+}
+
+// The dependent-subscriber (policyholder) columns. These describe the OTHER person
+// whose policy the patient rides on; when the patient IS the policyholder
+// ('self'), none of them apply and they are cleared so stale policyholder PHI can
+// never linger and leak into a later dependent claim. subscriber_relationship is
+// intentionally NOT in this list — it holds the 'self' value that triggers the clear.
+const POLICYHOLDER_COLS = [
+  'subscriber_name',
+  'subscriber_dob',
+  'subscriber_gender',
+  'subscriber_address_line1',
+  'subscriber_address_line2',
+  'subscriber_city',
+  'subscriber_state',
+  'subscriber_postal_code',
+];
+
 // --- shaping -----------------------------------------------------------------
 
 // Build the compact VOB summary the UI renders from a stored 271 payload,
@@ -148,6 +177,12 @@ function shapeRecord(r) {
     subscriber_relationship: r.subscriber_relationship,
     subscriber_name: r.subscriber_name,
     subscriber_dob: r.subscriber_dob,
+    subscriber_gender: r.subscriber_gender,
+    subscriber_address_line1: r.subscriber_address_line1,
+    subscriber_address_line2: r.subscriber_address_line2,
+    subscriber_city: r.subscriber_city,
+    subscriber_state: r.subscriber_state,
+    subscriber_postal_code: r.subscriber_postal_code,
     oon_deductible_total: r.oon_deductible_total,
     oon_deductible_met: r.oon_deductible_met,
     oon_reimbursement_rate: r.oon_reimbursement_rate,
@@ -205,6 +240,11 @@ async function createRecord(practiceId, body, event, authCtx) {
     return json(400, { error: 'Invalid subscriber_dob. Expected YYYY-MM-DD.' }, event);
   }
 
+  const gender = parseGender(body.subscriber_gender);
+  if (!gender.ok) {
+    return json(400, { error: 'Invalid subscriber_gender. Expected female, male, or unknown.' }, event);
+  }
+
   const total = parseMoney(body.oon_deductible_total);
   if (!total.ok) {
     return json(400, { error: 'Invalid oon_deductible_total. Expected a number >= 0.' }, event);
@@ -231,14 +271,32 @@ async function createRecord(practiceId, body, event, authCtx) {
     isPrimary = b.value;
   }
 
+  // When the patient IS the policyholder ('self'), never store any policyholder
+  // (dependent-subscriber) demographics — they describe a different person and
+  // would be a latent leak. A well-behaved client omits them for self already;
+  // this makes it structural.
+  const relationship = cleanText(body.subscriber_relationship);
+  const isSelf = relationship === 'self';
+  const subName = isSelf ? null : cleanText(body.subscriber_name);
+  const subDob = isSelf ? null : dob;
+  const subGender = isSelf ? null : gender.value;
+  const subAddr1 = isSelf ? null : cleanText(body.subscriber_address_line1);
+  const subAddr2 = isSelf ? null : cleanText(body.subscriber_address_line2);
+  const subCity = isSelf ? null : cleanText(body.subscriber_city);
+  const subState = isSelf ? null : cleanText(body.subscriber_state);
+  const subPostal = isSelf ? null : cleanText(body.subscriber_postal_code);
+
   // benefits_checked_at and benefits_raw are system-managed — never accepted
   // from the client, so they are left null at creation.
   const res = await db.query(
     `insert into insurance_records
        (practice_id, client_id, carrier_name, member_id, group_number, plan_type,
         subscriber_relationship, subscriber_name, subscriber_dob,
+        subscriber_gender, subscriber_address_line1, subscriber_address_line2,
+        subscriber_city, subscriber_state, subscriber_postal_code,
         oon_deductible_total, oon_deductible_met, oon_reimbursement_rate, payer_id, is_primary)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, coalesce($14, true))
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+             $16, $17, $18, $19, coalesce($20, true))
      returning *`,
     [
       practiceId,
@@ -247,9 +305,15 @@ async function createRecord(practiceId, body, event, authCtx) {
       cleanText(body.member_id),
       cleanText(body.group_number),
       cleanText(body.plan_type),
-      cleanText(body.subscriber_relationship),
-      cleanText(body.subscriber_name),
-      dob,
+      relationship,
+      subName,
+      subDob,
+      subGender,
+      subAddr1,
+      subAddr2,
+      subCity,
+      subState,
+      subPostal,
       total.value,
       met.value,
       rate.value,
@@ -354,24 +418,57 @@ async function updateRecord(practiceId, id, body, event, authCtx) {
     changes[col] = val;
   };
 
-  // Optional nullable text fields.
+  // Does this request flip the patient's relationship to the policyholder back to
+  // 'self'? When it does, every policyholder (dependent-subscriber) column is
+  // cleared below, regardless of what the body carries for them — so stale
+  // policyholder PHI can never linger on a self policy and leak into a later
+  // dependent claim (the coalesce/partial-update idiom would otherwise preserve
+  // it, since the form hides and drops those fields on 'self'). The Stedi builder
+  // already ignores them on a self claim, but leaving them in the DB is a leak the
+  // moment the relationship flips back to a dependent value.
+  const flipToSelf =
+    'subscriber_relationship' in body && cleanText(body.subscriber_relationship) === 'self';
+
+  // Optional nullable text fields that always apply.
   for (const col of [
     'carrier_name',
     'member_id',
     'group_number',
     'plan_type',
     'subscriber_relationship',
-    'subscriber_name',
   ]) {
     if (col in body) add(col, cleanText(body[col]));
   }
 
-  if ('subscriber_dob' in body) {
-    const dob = cleanText(body.subscriber_dob);
-    if (dob && !isValidDate(dob)) {
-      return json(400, { error: 'Invalid subscriber_dob. Expected YYYY-MM-DD.' }, event);
+  // Policyholder (dependent-subscriber) fields. Skipped from the body entirely on
+  // a self-flip — they are force-cleared to NULL at the end instead.
+  if (!flipToSelf) {
+    if ('subscriber_gender' in body) {
+      const g = parseGender(body.subscriber_gender);
+      if (!g.ok) {
+        return json(400, { error: 'Invalid subscriber_gender. Expected female, male, or unknown.' }, event);
+      }
+      add('subscriber_gender', g.value);
     }
-    add('subscriber_dob', dob);
+
+    for (const col of [
+      'subscriber_name',
+      'subscriber_address_line1',
+      'subscriber_address_line2',
+      'subscriber_city',
+      'subscriber_state',
+      'subscriber_postal_code',
+    ]) {
+      if (col in body) add(col, cleanText(body[col]));
+    }
+
+    if ('subscriber_dob' in body) {
+      const dob = cleanText(body.subscriber_dob);
+      if (dob && !isValidDate(dob)) {
+        return json(400, { error: 'Invalid subscriber_dob. Expected YYYY-MM-DD.' }, event);
+      }
+      add('subscriber_dob', dob);
+    }
   }
 
   if ('oon_deductible_total' in body) {
@@ -412,6 +509,12 @@ async function updateRecord(practiceId, id, body, event, authCtx) {
       return json(400, { error: 'Invalid is_primary. Expected a boolean.' }, event);
     }
     add('is_primary', b.value);
+  }
+
+  // Flipping to 'self': clear every policyholder column to NULL. These were skipped
+  // from the body loop above, so there is no duplicate SET for the same column.
+  if (flipToSelf) {
+    for (const col of POLICYHOLDER_COLS) add(col, null);
   }
 
   if (sets.length === 0) {

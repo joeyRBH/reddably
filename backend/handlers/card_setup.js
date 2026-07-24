@@ -376,6 +376,16 @@ exports.handler = async (event) => {
       const subscriberRelationship = cleanField(body.subscriber_relationship);
       const subscriberName = cleanField(body.subscriber_name);
       const subscriberDob = cleanField(body.subscriber_dob);
+      // Policyholder (dependent-subscriber) demographics — CMS-1500 Box 7 / 11a.
+      // Only meaningful when the patient is NOT the policyholder; cleared on 'self'
+      // (see subscriberIsSelf below). Gender is lower-cased and validated against
+      // the same female|male|unknown vocabulary the DB CHECK enforces.
+      const subscriberGender = cleanField(body.subscriber_gender).toLowerCase();
+      const subscriberAddress1 = cleanField(body.subscriber_address_line1);
+      const subscriberAddress2 = cleanField(body.subscriber_address_line2);
+      const subscriberCity = cleanField(body.subscriber_city);
+      const subscriberState = cleanField(body.subscriber_state);
+      const subscriberPostal = cleanField(body.subscriber_postal_code);
       // payer_id maps to insurance_records.payer_id varchar(50). It exists only when
       // the patient PICKED a payer-directory match — free text never yields one.
       const payerId = cleanField(body.payer_id);
@@ -401,7 +411,10 @@ exports.handler = async (event) => {
         );
       }
 
-      for (const v of [carrierName, memberId, groupNumber, subscriberRelationship, subscriberName, subscriberDob]) {
+      for (const v of [
+        carrierName, memberId, groupNumber, subscriberRelationship, subscriberName, subscriberDob,
+        subscriberAddress1, subscriberAddress2, subscriberCity, subscriberState, subscriberPostal,
+      ]) {
         if (v.length > MAX_FIELD_LEN) return json(400, { error: 'One of the fields is too long.' }, event);
       }
       if (payerId.length > 50) return json(400, { error: 'One of the fields is too long.' }, event);
@@ -411,6 +424,16 @@ exports.handler = async (event) => {
       if (subscriberDob && !/^\d{4}-\d{2}-\d{2}$/.test(subscriberDob)) {
         return json(400, { error: 'Date of birth must be YYYY-MM-DD.' }, event);
       }
+      if (subscriberGender && !['female', 'male', 'unknown'].includes(subscriberGender)) {
+        return json(400, { error: 'Invalid policyholder gender.' }, event);
+      }
+
+      // When the patient IS the policyholder, no dependent-subscriber demographics
+      // apply. Clear them (below) rather than coalescing, so a patient who first
+      // said "child" and then corrected to "self" doesn't leave stale policyholder
+      // PHI on the record. The relationship select on the page always sends a value,
+      // so an explicit 'self' is a reliable trigger.
+      const subscriberIsSelf = subscriberRelationship === 'self';
 
       // Authoritative either way — the id the patient picked, or an explicit null when
       // they used the escape hatch. Deliberately NOT coalesced onto the existing value:
@@ -431,26 +454,56 @@ exports.handler = async (event) => {
 
       if (existing.rows[0]) {
         // Update only the fields the patient actually provided — never null out
-        // existing data. coalesce(nullif($n, ''), col) keeps the current value
-        // when the incoming field is blank.
+        // existing data with a blank. coalesce(nullif($n, ''), col) keeps the
+        // current value when the incoming field is blank. EXCEPTION: when the
+        // patient is the policyholder ($5 subscriberIsSelf), every dependent-
+        // subscriber column is force-cleared to NULL — a coalesce would otherwise
+        // preserve stale policyholder PHI (name/DOB/gender/address) that then leaks
+        // if the relationship later flips back to a dependent value.
         await db.query(
           `update insurance_records set
-              carrier_name            = coalesce(nullif($1, ''), carrier_name),
-              member_id               = coalesce(nullif($2, ''), member_id),
-              group_number            = coalesce(nullif($3, ''), group_number),
-              subscriber_relationship = coalesce(nullif($4, ''), subscriber_relationship),
-              subscriber_name         = coalesce(nullif($5, ''), subscriber_name),
-              subscriber_dob          = coalesce(nullif($6, '')::date, subscriber_dob),
-              payer_id                = $7
-            where id = $8`,
-          [carrierName, memberId, groupNumber, subscriberRelationship, subscriberName, subscriberDob, payerIdOrNull, existing.rows[0].id]
+              carrier_name             = coalesce(nullif($1, ''), carrier_name),
+              member_id                = coalesce(nullif($2, ''), member_id),
+              group_number             = coalesce(nullif($3, ''), group_number),
+              subscriber_relationship  = coalesce(nullif($4, ''), subscriber_relationship),
+              subscriber_name          = case when $5::boolean then null else coalesce(nullif($6, ''), subscriber_name) end,
+              subscriber_dob           = case when $5::boolean then null else coalesce(nullif($7, '')::date, subscriber_dob) end,
+              subscriber_gender        = case when $5::boolean then null else coalesce(nullif($8, ''), subscriber_gender) end,
+              subscriber_address_line1 = case when $5::boolean then null else coalesce(nullif($9, ''), subscriber_address_line1) end,
+              subscriber_address_line2 = case when $5::boolean then null else coalesce(nullif($10, ''), subscriber_address_line2) end,
+              subscriber_city          = case when $5::boolean then null else coalesce(nullif($11, ''), subscriber_city) end,
+              subscriber_state         = case when $5::boolean then null else coalesce(nullif($12, ''), subscriber_state) end,
+              subscriber_postal_code   = case when $5::boolean then null else coalesce(nullif($13, ''), subscriber_postal_code) end,
+              payer_id                 = $14
+            where id = $15`,
+          [
+            carrierName, memberId, groupNumber, subscriberRelationship, subscriberIsSelf,
+            subscriberName, subscriberDob, subscriberGender,
+            subscriberAddress1, subscriberAddress2, subscriberCity, subscriberState, subscriberPostal,
+            payerIdOrNull, existing.rows[0].id,
+          ]
         );
       } else {
+        // No primary record yet — insert. On 'self' the policyholder columns are
+        // stored NULL (blanked in JS below), matching the update's clear semantics.
+        const insName = subscriberIsSelf ? '' : subscriberName;
+        const insDob = subscriberIsSelf ? '' : subscriberDob;
+        const insGender = subscriberIsSelf ? '' : subscriberGender;
+        const insAddr1 = subscriberIsSelf ? '' : subscriberAddress1;
+        const insAddr2 = subscriberIsSelf ? '' : subscriberAddress2;
+        const insCity = subscriberIsSelf ? '' : subscriberCity;
+        const insState = subscriberIsSelf ? '' : subscriberState;
+        const insPostal = subscriberIsSelf ? '' : subscriberPostal;
         await db.query(
           `insert into insurance_records
              (practice_id, client_id, carrier_name, member_id, group_number,
-              subscriber_relationship, subscriber_name, subscriber_dob, payer_id, is_primary)
-           values ($1, $2, $3, $4, nullif($5, ''), nullif($6, ''), nullif($7, ''), nullif($8, '')::date, $9, true)`,
+              subscriber_relationship, subscriber_name, subscriber_dob,
+              subscriber_gender, subscriber_address_line1, subscriber_address_line2,
+              subscriber_city, subscriber_state, subscriber_postal_code, payer_id, is_primary)
+           values ($1, $2, $3, $4, nullif($5, ''),
+                   nullif($6, ''), nullif($7, ''), nullif($8, '')::date,
+                   nullif($9, ''), nullif($10, ''), nullif($11, ''),
+                   nullif($12, ''), nullif($13, ''), nullif($14, ''), $15, true)`,
           [
             client.practice_id,
             clientId,
@@ -458,8 +511,14 @@ exports.handler = async (event) => {
             memberId,
             groupNumber,
             subscriberRelationship,
-            subscriberName,
-            subscriberDob,
+            insName,
+            insDob,
+            insGender,
+            insAddr1,
+            insAddr2,
+            insCity,
+            insState,
+            insPostal,
             payerIdOrNull,
           ]
         );
