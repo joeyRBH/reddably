@@ -71,6 +71,17 @@
       ('#' + String(claim.id).slice(0, 8));
   }
 
+  // A claim carries CMS frequency-7 replacement intent when it declares that
+  // frequency or references the claim it replaces. Drives the replacement confirm
+  // dialog and the provenance line on the detail screen.
+  function isReplacementClaim(claim) {
+    return !!claim && (claim.submission_frequency_code === '7' || claim.corrects_claim_id != null);
+  }
+
+  function shortId(id) {
+    return '#' + String(id || '').slice(0, 8);
+  }
+
   function inlineEmpty(text) {
     return h('p', {
       class: 'empty-state__body',
@@ -294,7 +305,15 @@
     }
 
     // --- Lifecycle actions (each re-renders the whole detail on success) -----
-    function doSubmit() {
+    function doSubmit(claim) {
+      // A replacement draft goes straight to send(): the server returns a
+      // replacement confirmation (requires_confirmation) that the dialog renders
+      // with the exact "replaces a previously accepted claim" language and the
+      // payer claim number — so no generic pre-confirm here.
+      if (isReplacementClaim(claim)) {
+        send(false);
+        return;
+      }
       R.confirmModal({
         title: 'Submit claim?',
         body: 'Sends the claim to the clearinghouse.',
@@ -302,6 +321,31 @@
       }).then(function (ok) {
         if (!ok) return;
         send(false);
+      });
+    }
+
+    // Create a frequency-7 replacement of this (accepted) claim: capture the payer's
+    // original claim number, POST /replace to mint a replacement draft, then open it
+    // so the operator can review and submit it (with the replacement confirm dialog).
+    function doReplace() {
+      R.formModal({
+        title: 'Replace this claim',
+        fields: [
+          { name: 'payer_claim_control_number', label: "Payer's original claim number",
+            type: 'text', required: true, placeholder: 'e.g. the ICN / DCN on the remittance',
+            hint: 'Files a replacement (frequency 7) asking the payer to replace the claim ' +
+              'it already accepted — not a new original. Enter the payer\'s original claim ' +
+              'number from the EOB / remittance. You\'ll confirm again before it is sent.' },
+        ],
+        submitLabel: 'Create replacement',
+      }).then(function (values) {
+        if (!values) return;
+        api.claims.replace(id, compact(values)).then(function (res) {
+          R.toast('Replacement draft created — review and submit', 'success');
+          R.navigate('claims/' + res.claim.id);
+        }).catch(function (err) {
+          R.toast(err.message, 'error');
+        });
       });
     }
 
@@ -325,18 +369,45 @@
 
     // Modal listing the server's pre-submission warnings. "Submit anyway" resends
     // with confirmed=true; "Cancel" leaves the claim a draft (nothing was sent).
+    // A `replacement_claim` warning is rendered distinctly — the operator must
+    // acknowledge it replaces a previously accepted claim and see the payer claim
+    // number before it is sent (it is never sent as a new original).
     function confirmWarnings(warnings) {
-      var items = warnings.map(function (w) {
-        return h('li', { style: 'margin:0 0 var(--space-2)' }, (w && w.message) || 'Please review this claim.');
+      var replacement = null;
+      var rest = [];
+      warnings.forEach(function (w) {
+        if (w && w.code === 'replacement_claim') replacement = w;
+        else rest.push(w);
       });
-      var body = h('div', { class: 'stack', style: 'gap:var(--space-3)' }, [
-        h('p', { style: 'margin:0' }, 'Please review before submitting:'),
-        h('ul', { style: 'margin:0;padding-left:var(--space-5)' }, items),
-      ]);
+
+      var children = [];
+      if (replacement) {
+        var block = [
+          h('p', { style: 'margin:0;font-weight:600' }, (replacement && replacement.message) ||
+            'This replaces a previously accepted payer claim — it does not create a new original claim.'),
+        ];
+        if (replacement.payer_claim_control_number) {
+          block.push(h('p', { style: 'margin:0;font-size:var(--font-size-3)' },
+            [h('strong', null, 'Replacing payer claim #: '), String(replacement.payer_claim_control_number)]));
+        }
+        children.push(h('div', {
+          style: 'padding:var(--space-4);border-radius:var(--radius-2);' +
+            'background:var(--color-surface-sunken);display:flex;flex-direction:column;gap:var(--space-2)',
+        }, block));
+      }
+      if (rest.length) {
+        children.push(h('p', { style: 'margin:0' }, 'Please review before submitting:'));
+        children.push(h('ul', { style: 'margin:0;padding-left:var(--space-5)' },
+          rest.map(function (w) {
+            return h('li', { style: 'margin:0 0 var(--space-2)' }, (w && w.message) || 'Please review this claim.');
+          })));
+      }
+
+      var body = h('div', { class: 'stack', style: 'gap:var(--space-3)' }, children);
       R.confirmModal({
-        title: 'Double-check this claim',
+        title: replacement ? 'Confirm replacement claim' : 'Double-check this claim',
         body: body,
-        confirmLabel: 'Submit anyway',
+        confirmLabel: replacement ? 'Submit replacement' : 'Submit anyway',
         cancelLabel: 'Cancel',
       }).then(function (ok) {
         if (ok) send(true);
@@ -476,7 +547,7 @@
       }
       if (s === 'draft') {
         return [
-          btn('Submit', 'btn--primary', doSubmit),
+          btn('Submit', 'btn--primary', function () { doSubmit(claim); }),
           btn('Edit claim', 'btn--ghost', function () { doEditClaim(claim); }),
           btn('Claim #', 'btn--ghost', function () { doEdit(claim); }),
           btn('Delete', 'btn--danger', doDelete),
@@ -495,12 +566,17 @@
           s === 'appealed') {
         return [
           btn('Refresh', 'btn--primary', doRefresh),
+          btn('Replace claim', 'btn--ghost', doReplace),
           btn('Void', 'btn--danger', doVoid),
         ];
       }
       if (s === 'paid') {
-        // Terminal: voiding a paid claim would 409, so omit Void.
-        return [btn('Refresh', 'btn--primary', doRefresh)];
+        // Terminal: voiding a paid claim would 409, so omit Void. A paid claim the
+        // payer accepted can still be replaced (frequency 7) to correct it.
+        return [
+          btn('Refresh', 'btn--primary', doRefresh),
+          btn('Replace claim', 'btn--ghost', doReplace),
+        ];
       }
       if (s === 'void') {
         return [btn('Delete', 'btn--danger', doDelete)];
@@ -535,6 +611,27 @@
           }, [h('strong', null, 'Denial reason: '), R.scrubVendor(claim.denial_reason)])
         : null;
 
+      // Replacement provenance: this claim replaces a previously accepted claim
+      // (CMS frequency 7). Links to the replaced claim and shows the payer claim
+      // number so staff read it as a replacement, not a new original.
+      var replacementNote = isReplacementClaim(claim)
+        ? h('div', {
+            style: 'padding:var(--space-3) var(--space-4);border-radius:var(--radius-2);' +
+              'background:var(--color-surface-sunken);font-size:var(--font-size-3);' +
+              'display:flex;flex-wrap:wrap;gap:var(--space-2) var(--space-3);align-items:baseline',
+          }, [
+            h('strong', null, 'Replacement claim (frequency 7).'),
+            claim.corrects_claim_id
+              ? h('a', { href: '#claims/' + claim.corrects_claim_id, style: 'color:var(--color-primary)' },
+                  'Replaces claim ' + shortId(claim.corrects_claim_id))
+              : h('span', null, 'Replaces a previously accepted claim.'),
+            claim.payer_claim_control_number
+              ? h('span', { style: 'color:var(--color-text-muted)' },
+                  'Payer claim #: ' + claim.payer_claim_control_number)
+              : null,
+          ])
+        : null;
+
       return h('div', { class: 'card' }, [
         h('div', { class: 'card__header' }, [
           h('div', { style: 'display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap' }, [
@@ -545,6 +642,7 @@
         ]),
         h('div', { style: 'display:flex;flex-direction:column;gap:var(--space-4)' }, [
           contextEl,
+          replacementNote,
           grid,
           denial,
         ]),

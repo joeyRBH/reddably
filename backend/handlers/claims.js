@@ -32,6 +32,7 @@ const {
   logClaimEvent: logEvent,
   logClaimAcknowledgment: logAck,
   insertDraftClaim,
+  insertReplacementClaim,
   ensurePatientControlNumber,
 } = require('../lib/claims');
 
@@ -41,6 +42,21 @@ const CLAIM_STATUSES = [
   'draft', 'submitted', 'processing', 'info_requested',
   'denied', 'appealed', 'paid', 'void',
 ];
+
+// A claim can be REPLACED (superseded by a CMS frequency-7 replacement) only after
+// the payer has ACCEPTED it: it was successfully transmitted (has a control number)
+// and is in an accepted lifecycle state. `denied` takes the correction/appeal path,
+// not replacement; `draft`/`void` were never accepted. Frequency 7 ONLY — void
+// (frequency 8) is a separate, later capability.
+const REPLACEABLE_STATUSES = ['submitted', 'processing', 'info_requested', 'appealed', 'paid'];
+
+// A claim carries replacement (frequency 7) intent when the durable frequency code
+// says so, or when it references the claim it replaces. Either alone is enough to
+// route it through the safety gate (both are set together by the /replace flow, but
+// checking both means a half-populated row can never slip out as a new original).
+function isReplacementClaim(claim) {
+  return claim.submission_frequency_code === '7' || claim.corrects_claim_id != null;
+}
 
 // claim_events.event_type enum (distinct from claim status). Used when logging.
 function eventTypeForStatus(status) {
@@ -120,6 +136,12 @@ function shapeClaim(r) {
     claim_number: r.claim_number,
     control_number: r.control_number,
     patient_control_number: r.patient_control_number,
+    // Replacement (CMS frequency 7) provenance — present on replacement claims,
+    // null on ordinary originals. Lets the UI show a replacement badge, the
+    // lineage, and the payer claim number in the submit-confirm dialog.
+    submission_frequency_code: r.submission_frequency_code,
+    payer_claim_control_number: r.payer_claim_control_number,
+    corrects_claim_id: r.corrects_claim_id,
     clearinghouse: r.clearinghouse,
     status: r.status,
     billed_amount: r.billed_amount,
@@ -720,12 +742,66 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
     }, event);
   }
 
+  // Replacement (CMS frequency 7) safety gate. A replacement asks the payer to
+  // REPLACE a claim it already accepted; getting it wrong files another duplicate.
+  // Every failure below is a HARD REJECT, never a silent downgrade to a new
+  // original ('1') — a downgrade would create exactly the duplicate this feature
+  // exists to prevent. Runs before the soft-warning flow and regardless of
+  // `confirmed`. ("Not in an eligible lifecycle state" and "currently submitting"
+  // are already enforced above: the status!=='draft' check 409s, and the atomic
+  // status='draft'-gated UPDATE below is the in-flight guard for concurrent submits.)
+  if (isReplacementClaim(claim)) {
+    // (1) Must carry the payer's ORIGINAL claim number. Without it the builder
+    //     cannot form REF*F8 and the claim would go out as a duplicate original.
+    if (!cleanText(claim.payer_claim_control_number)) {
+      return json(422, {
+        error: "This replacement is missing the payer's original claim number, so it cannot be filed. Re-create the replacement with that number.",
+      }, event);
+    }
+    // (2) Must reference an original that exists and was successfully transmitted
+    //     and accepted — otherwise there is nothing for the payer to replace.
+    if (!claim.corrects_claim_id) {
+      return json(422, { error: 'This replacement does not reference the claim it replaces.' }, event);
+    }
+    const original = await loadClaim(practiceId, claim.corrects_claim_id);
+    if (!original || !cleanText(original.control_number) || !REPLACEABLE_STATUSES.includes(original.status)) {
+      return json(422, {
+        error: 'The claim being replaced was never accepted by the payer, so it cannot be replaced.',
+      }, event);
+    }
+    // (3) Never file two replacements of the same original. If another replacement
+    //     of this original has already been submitted (has a control number), a
+    //     second would create yet another duplicate — refuse.
+    const priorReplacement = await db.query(
+      `select 1 from claims
+        where practice_id = $1 and corrects_claim_id = $2 and id <> $3
+          and is_hidden = false and control_number is not null
+        limit 1`,
+      [practiceId, claim.corrects_claim_id, id]
+    );
+    if (priorReplacement.rowCount > 0) {
+      return json(409, { error: 'A replacement for this claim has already been submitted.' }, event);
+    }
+  }
+
   // Soft pre-submission sanity check. Warnings never hard-block: without an
   // explicit confirmed:true the submit is held and the warnings are returned so
   // the UI can list them and offer "Submit anyway". Audit records CODES only —
   // the messages may embed non-PHI context but are never written to the log.
   const confirmed = body && body.confirmed === true;
   const warnings = evaluateSubmissionWarnings(ctx);
+  // A replacement ALWAYS requires an explicit confirmation before it is sent: the
+  // operator must acknowledge it replaces a previously accepted claim (and see the
+  // payer claim number) rather than filing a new original. Prepended as a warning
+  // so it flows through the existing confirmation gate; only its CODE is audited,
+  // never the payer claim number it carries for the dialog.
+  if (isReplacementClaim(claim)) {
+    warnings.unshift({
+      code: 'replacement_claim',
+      message: 'This replaces a previously accepted payer claim — it does not create a new original claim.',
+      payer_claim_control_number: cleanText(claim.payer_claim_control_number),
+    });
+  }
   if (warnings.length && !confirmed) {
     await audit(event, authCtx, {
       action: 'claim.submit_warned',
@@ -784,6 +860,11 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
     return json(502, { error: 'Clearinghouse submission failed.' }, event);
   }
 
+  // The frequency actually submitted, persisted durably on the claim (the
+  // submission record) so we can always explain what was sent — '7' for a
+  // replacement (already stored, reaffirmed here), '1' for an ordinary original.
+  const submittedFrequency = isReplacementClaim(claim) ? '7' : '1';
+
   const updated = await db.withTransaction(async (client) => {
     const res = await client.query(
       `update claims
@@ -792,14 +873,16 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
               control_number = $1,
               claim_number = coalesce(claim_number, $2),
               clearinghouse = $3,
-              clearinghouse_payload = $4
-        where id = $5 and practice_id = $6 and is_hidden = false and status = 'draft'
+              clearinghouse_payload = $4,
+              submission_frequency_code = $5
+        where id = $6 and practice_id = $7 and is_hidden = false and status = 'draft'
         returning *`,
       [
         cleanText(result.control_number),
         cleanText(result.claim_number),
         adapter.name,
         result.raw != null ? JSON.stringify(result.raw) : null,
+        submittedFrequency,
         id,
         practiceId,
       ]
@@ -813,7 +896,13 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
       eventType: 'submitted',
       statusFrom: 'draft',
       statusTo: 'submitted',
-      note: 'Submitted electronically.',
+      // Human-readable snapshot of what was filed on the submission record. Names
+      // the replaced claim by short id only — never the payer claim number (PHI-
+      // adjacent, and it lives structured in payer_claim_control_number already).
+      note: submittedFrequency === '7'
+        ? 'Submitted electronically as a replacement (frequency 7) of claim #' +
+          String(claim.corrects_claim_id || '').slice(0, 8) + '.'
+        : 'Submitted electronically.',
       payload: result.raw,
     });
     // Persist the submission acknowledgment (277CA) verbatim — passive dataset,
@@ -1003,6 +1092,69 @@ async function voidClaim(practiceId, userId, id, event, authCtx) {
   return json(200, { claim: shapeClaim(updated) }, event);
 }
 
+// POST /claims/{id}/replace — create a CMS frequency-7 REPLACEMENT of an accepted
+// claim. The {id} claim is the ORIGINAL (payer-accepted) claim; this creates a NEW
+// draft claim on the same session carrying the durable replacement intent
+// (submission_frequency_code '7', the payer's original claim number, corrects_claim_id).
+// It does NOT submit — the operator reviews the new draft and submits it through the
+// normal submit path, which emits frequency 7, shows the replacement confirm dialog,
+// and runs the safety gate. Frequency 7 ONLY (void / frequency 8 is a later change).
+async function replaceClaim(practiceId, userId, id, body, event, authCtx) {
+  if (!isUUID(id)) return json(404, { error: 'Not found' }, event);
+  const original = await loadClaim(practiceId, id);
+  if (!original) return json(404, { error: 'Not found' }, event);
+
+  // Only a claim the payer accepted can be replaced: it must have been successfully
+  // transmitted (has a control number) and be in an accepted lifecycle state. Denied
+  // claims take the correction/appeal path; draft/void were never accepted.
+  if (!REPLACEABLE_STATUSES.includes(original.status) || !cleanText(original.control_number)) {
+    return json(409, {
+      error: 'Only a claim the payer has accepted can be replaced. Denied claims are corrected or appealed; drafts are edited directly.',
+    }, event);
+  }
+
+  // The payer's ORIGINAL claim number is entered explicitly by the operator (from
+  // the EOB / 277CA / 835). We deliberately do NOT auto-parse it from the stored
+  // acknowledgments in v1 — allow explicit entry only.
+  const payerClaimControlNumber = cleanText(body && body.payer_claim_control_number);
+  if (!payerClaimControlNumber) {
+    return json(400, {
+      error: "The payer's original claim number is required to file a replacement.",
+    }, event);
+  }
+
+  // One live replacement per original: refuse if a non-hidden, non-void replacement
+  // of this claim already exists (a draft in progress or an already-submitted one).
+  // A voided replacement does not count, so a bad attempt can be voided and redone.
+  const existing = await db.query(
+    `select 1 from claims
+      where practice_id = $1 and corrects_claim_id = $2 and is_hidden = false and status <> 'void'
+      limit 1`,
+    [practiceId, id]
+  );
+  if (existing.rowCount > 0) {
+    return json(409, { error: 'A replacement for this claim already exists.' }, event);
+  }
+
+  const created = await db.withTransaction(async (client) => {
+    return insertReplacementClaim(client, {
+      practiceId,
+      original,
+      payerClaimControlNumber,
+      createdBy: userId,
+    });
+  });
+
+  await audit(event, authCtx, {
+    action: 'claim.replace_create',
+    resourceType: 'claim',
+    resourceId: created.id,
+    // ids / field names only — never the payer claim number (PHI-adjacent).
+    metadata: { corrects_claim_id: id },
+  });
+  return json(201, { claim: shapeClaim(created) }, event);
+}
+
 // Claim statuses whose derived fields may be regenerated from the underlying
 // session. A draft has not been sent yet; a denied claim is being corrected for
 // resubmission/appeal. Everything else (submitted/processing/paid/void/...) is
@@ -1079,6 +1231,8 @@ exports.missingDependentPolicyholderField = missingDependentPolicyholderField;
 exports.evaluateSubmissionWarnings = evaluateSubmissionWarnings;
 exports.ageInYears = ageInYears;
 exports.REGENERATABLE_STATUSES = REGENERATABLE_STATUSES;
+exports.REPLACEABLE_STATUSES = REPLACEABLE_STATUSES;
+exports.isReplacementClaim = isReplacementClaim;
 // Pure shapers exported for unit testing (no DB / network).
 exports.shapeClaim = shapeClaim;
 exports.shapeClaimDetail = shapeClaimDetail;
@@ -1111,6 +1265,7 @@ exports.handler = async (event) => {
 
     // Action sub-routes (id always present) take precedence over base CRUD.
     if (action === 'submit' && method === 'POST' && id) return await submitClaim(practiceId, userId, id, body, event, authCtx);
+    if (action === 'replace' && method === 'POST' && id) return await replaceClaim(practiceId, userId, id, body, event, authCtx);
     if (action === 'refresh' && method === 'POST' && id) return await refreshClaim(practiceId, userId, id, event, authCtx);
     if (action === 'void' && method === 'POST' && id) return await voidClaim(practiceId, userId, id, event, authCtx);
     if (action === 'regenerate' && method === 'POST' && id) return await regenerateClaim(practiceId, userId, id, event, authCtx);

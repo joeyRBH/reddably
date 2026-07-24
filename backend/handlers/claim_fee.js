@@ -108,6 +108,21 @@ exports.handler = async (event) => {
     const action = subAction(event);
 
     if (action === 'context') {
+      // A REPLACEMENT (CMS frequency 7) claim never charges the platform fee: it is
+      // a new claim row, but it supersedes a claim on which the fee was already
+      // collected — charging again would bill the patient another 5% for the same
+      // service. Authoritative enforcement lives HERE (the client also skips the
+      // call), so an old or bypassed client still cannot double-charge. Keyed on the
+      // reference OR the frequency, mirroring the submit-handler / builder gate.
+      //
+      // Edge noted for later: if the ORIGINAL's fee charge FAILED (never collected),
+      // the fee is genuinely still owed and this skip means the replacement won't
+      // collect it either. The default is deliberately "a replacement does not
+      // re-charge"; a later change could detect a missing/failed original
+      // platform_fee transaction and charge on the replacement instead.
+      if (claim.corrects_claim_id != null || claim.submission_frequency_code === '7') {
+        return json(200, { charge: false, reason: 'replacement_claim' }, event);
+      }
       if (await alreadyCharged(claim.id)) {
         return json(200, { charge: false, reason: 'already_charged' }, event);
       }
