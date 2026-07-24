@@ -121,6 +121,19 @@
     { name: 'duration_minutes', label: 'Duration (min)', type: 'number' },
     { name: 'fee',              label: 'Fee',            type: 'number' },
     { name: 'place_of_service', label: 'Place of service', type: 'text' },
+    { name: 'procedure_modifiers', label: 'Procedure modifiers', type: 'text',
+      placeholder: '95, GT',
+      hint: 'Optional payer-required modifiers, comma-separated. Example: 95 for ' +
+        'some synchronous telehealth claims — verify payer requirements.',
+      // Comma-separated text → an array of uppercased two-character codes. The
+      // backend re-validates (≤4 entries, each exactly two alphanumeric chars,
+      // trimmed, de-duplicated) and is authoritative; this just shapes the input.
+      transform: function (v) {
+        return String(v || '')
+          .split(',')
+          .map(function (s) { return s.trim().toUpperCase(); })
+          .filter(Boolean);
+      } },
     { name: 'diagnosis_codes',  label: 'Diagnosis code(s)', type: 'diagnosis',
       placeholder: 'Search code or condition (e.g. F411 or anxiety)…' },
     { name: 'status',           label: 'Status',         type: 'select',

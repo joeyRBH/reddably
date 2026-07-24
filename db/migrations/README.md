@@ -64,3 +64,8 @@ done
   meant "ready for claim submission"). Moves any surviving `ready` row to `awaiting_info`
   *before* recreating the CHECK, and never to `active` — nobody becomes billable via a
   migration. Patient intake now sets the status itself (`backend/handlers/card_setup.js`).
+- `017_add_procedure_modifiers_to_sessions.sql` — adds `procedure_modifiers text[]` to
+  `sessions` (CMS-1500 Box 24D / 837P service-line modifiers, e.g. `95` for synchronous
+  telehealth). Optional and payer-specific; validated + normalized by
+  `backend/handlers/sessions.js` and attached to the service line by
+  `backend/lib/clearinghouse/stedi.js`. `NULL` when a session carries none.

@@ -690,12 +690,22 @@
         errorEls[f.name] = errorEl;
 
         var labelText = f.label || f.name;
-        var fieldEl = h('label', { class: 'field' }, [
+        var labelChildren = [
           h('span', { class: 'field__label' },
             f.required ? [labelText, ' ', h('span', { 'aria-hidden': 'true' }, '*')] : labelText),
           display,
-          errorEl,
-        ]);
+        ];
+        // Optional persistent helper copy under the control (e.g. how an optional
+        // field is formatted). Muted, small; distinct from the validation error.
+        if (f.hint) {
+          labelChildren.push(h('p', {
+            class: 'field__hint',
+            style: 'margin:var(--space-1) 0 0;color:var(--color-text-muted);' +
+              'font-size:var(--font-size-2)',
+          }, f.hint));
+        }
+        labelChildren.push(errorEl);
+        var fieldEl = h('label', { class: 'field' }, labelChildren);
         fieldEls[f.name] = fieldEl;
         form.appendChild(fieldEl);
       });
