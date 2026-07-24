@@ -671,6 +671,13 @@
           });
           control = dxPicker.control;
           display = dxPicker.node;
+        } else if (type === 'checkbox') {
+          // A boolean toggle. Optionally UI-only (uiOnly): a convenience control
+          // like "same as patient" that copies values into other fields via
+          // onToggle and is never itself collected into the submitted payload.
+          control = h('input', { class: 'field__checkbox', type: 'checkbox', name: f.name });
+          if (initial === true || initial === 'true') control.checked = true;
+          display = control;
         } else {
           control = h('input', {
             class: 'field__control',
@@ -690,24 +697,49 @@
         errorEls[f.name] = errorEl;
 
         var labelText = f.label || f.name;
-        var labelChildren = [
-          h('span', { class: 'field__label' },
-            f.required ? [labelText, ' ', h('span', { 'aria-hidden': 'true' }, '*')] : labelText),
-          display,
-        ];
-        // Optional persistent helper copy under the control (e.g. how an optional
-        // field is formatted). Muted, small; distinct from the validation error.
-        if (f.hint) {
-          labelChildren.push(h('p', {
+        var hintNode = f.hint
+          ? h('p', {
             class: 'field__hint',
             style: 'margin:var(--space-1) 0 0;color:var(--color-text-muted);' +
               'font-size:var(--font-size-2)',
-          }, f.hint));
+          }, f.hint)
+          : null;
+
+        var fieldEl;
+        if (type === 'checkbox') {
+          // Checkbox row: box first, then the label text inline beside it.
+          var checkRow = h('span', {
+            style: 'display:flex;align-items:center;gap:var(--space-2)',
+          }, [display, h('span', { class: 'field__label' }, labelText)]);
+          var checkChildren = [checkRow];
+          if (hintNode) checkChildren.push(hintNode);
+          checkChildren.push(errorEl);
+          fieldEl = h('label', { class: 'field field--checkbox' }, checkChildren);
+        } else {
+          var labelChildren = [
+            h('span', { class: 'field__label' },
+              f.required ? [labelText, ' ', h('span', { 'aria-hidden': 'true' }, '*')] : labelText),
+            display,
+          ];
+          // Optional persistent helper copy under the control (e.g. how an optional
+          // field is formatted). Muted, small; distinct from the validation error.
+          if (hintNode) labelChildren.push(hintNode);
+          labelChildren.push(errorEl);
+          fieldEl = h('label', { class: 'field' }, labelChildren);
         }
-        labelChildren.push(errorEl);
-        var fieldEl = h('label', { class: 'field' }, labelChildren);
         fieldEls[f.name] = fieldEl;
         form.appendChild(fieldEl);
+      });
+
+      // Wire checkbox convenience toggles: a field may declare onToggle(checked,
+      // controls) to copy values into (or clear) other fields when it is ticked.
+      // Additive — no existing field uses this, so ordinary forms are unaffected.
+      fields.forEach(function (f) {
+        if (f.type === 'checkbox' && typeof f.onToggle === 'function') {
+          controls[f.name].addEventListener('change', function () {
+            f.onToggle(controls[f.name].checked, controls);
+          });
+        }
       });
 
       // Conditional visibility: a field may declare showIf(values) -> boolean.
@@ -748,6 +780,9 @@
         var out = {};
         var ok = true;
         fields.forEach(function (f) {
+          // UI-only controls (e.g. a "same as patient" checkbox) drive other
+          // fields but are never part of the submitted payload.
+          if (f.uiOnly) return;
           if (isHidden(f.name)) {
             setError(f.name, null);
             out[f.name] = null;

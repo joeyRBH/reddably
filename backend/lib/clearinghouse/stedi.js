@@ -540,6 +540,24 @@ function buildSubmissionBody(ctx) {
     };
   }
 
+  // Prior authorization number (CMS-1500 Box 23 / 837P claim-level REF*G1). This
+  // is CLAIM-LEVEL — specific to a course of treatment / date range / provider —
+  // NOT a property of the policy, so it is read from the claim, never the
+  // insurance record. Merge into claimSupplementalInformation the same merge-safe
+  // way the replacement block above does, so a replacement claim that ALSO carries
+  // a prior auth keeps BOTH keys (claimControlNumber + priorAuthorizationNumber).
+  // Omitted ENTIRELY when the claim carries none, so ordinary claims stay
+  // structurally unchanged (no claimSupplementalInformation at all). The child key
+  // name priorAuthorizationNumber MUST be confirmed against Stedi's live schema via
+  // the negative-control probe (see the PR) — a silently-wrong name drops the auth.
+  const priorAuth = cleanStr(claim.prior_authorization_number);
+  if (priorAuth) {
+    claimInformation.claimSupplementalInformation = {
+      ...(claimInformation.claimSupplementalInformation || {}),
+      priorAuthorizationNumber: priorAuth,
+    };
+  }
+
   // Dependent mode: when the insurance record names a subscriber relationship
   // other than 'self', the patient is a dependent on someone else's policy. The
   // 837P then wants the POLICYHOLDER in the subscriber loop and the PATIENT in a
@@ -555,11 +573,11 @@ function buildSubmissionBody(ctx) {
   let subscriber;
   let dependent = null;
   if (isDependent) {
-    // Policyholder in the subscriber loop. We only know what the insurance record
-    // carries — the policyholder name (split on the last space) and DOB — so build
-    // by adding present fields only (no empty strings leak in). Gender and address
-    // are unknown for the policyholder and the 837P only requires them when the
-    // subscriber is the patient, so they are omitted here.
+    // Policyholder in the subscriber loop. We build by adding present fields only
+    // (no empty strings leak in): the policyholder name (split on the last space),
+    // DOB, and — for payers that require them on a dependent claim — the
+    // policyholder's gender (Box 11a) and address (Box 7), each captured on the
+    // insurance record.
     subscriber = { paymentResponsibilityLevelCode: 'P' };
     if (insurance.member_id) subscriber.memberId = insurance.member_id;
     const [subFirst, subLast] = splitSubscriberName(insurance.subscriber_name);
@@ -567,6 +585,29 @@ function buildSubmissionBody(ctx) {
     if (subLast) subscriber.lastName = subLast;
     const subDob = ymd(insurance.subscriber_dob);
     if (subDob) subscriber.dateOfBirth = subDob;
+
+    // Policyholder gender (Box 11a). Map the stored female|male|unknown vocabulary
+    // through the SAME genderCode() helper the non-dependent subscriber branch uses
+    // (female→F, male→M, unknown→U). Present only when the record carries a gender:
+    // an explicit 'unknown' is sent as 'U' exactly as the non-dependent path emits
+    // it, but an UNSET gender omits the key entirely (never '' / null), so an
+    // ordinary dependent claim without demographics stays structurally unchanged.
+    if (insurance.subscriber_gender) {
+      subscriber.gender = genderCode(insurance.subscriber_gender);
+    }
+
+    // Policyholder address (Box 7). Build from present fields only and attach the
+    // address object ENTIRELY only when at least one line is present, so a
+    // dependent claim with no policyholder address omits the key rather than
+    // sending an all-undefined object. Field names mirror the non-dependent
+    // subscriber block (address1/address2/city/state/postalCode).
+    const subAddress = {};
+    if (insurance.subscriber_address_line1) subAddress.address1 = insurance.subscriber_address_line1;
+    if (insurance.subscriber_address_line2) subAddress.address2 = insurance.subscriber_address_line2;
+    if (insurance.subscriber_city) subAddress.city = insurance.subscriber_city;
+    if (insurance.subscriber_state) subAddress.state = insurance.subscriber_state;
+    if (insurance.subscriber_postal_code) subAddress.postalCode = insurance.subscriber_postal_code;
+    if (Object.keys(subAddress).length) subscriber.address = subAddress;
 
     // Patient in the dependent loop: the same client sources as the subscriber
     // block below, plus the relationship code. Gender is omitted when unknown (U).
@@ -826,8 +867,8 @@ function buildStatusBody(ctx) {
   // With no dependent object Stedi treats the subscriber as the patient, and when
   // dateOfBirth is present it REQUIRES gender. Source it the same way the 837 did:
   // the patient's (client) gender when the patient is the subscriber, the
-  // policyholder's persisted gender on a dependent claim (not currently captured →
-  // unknown). Map to Stedi's M/F; omit gender entirely when unknown/unmappable
+  // policyholder's persisted gender (insurance_records.subscriber_gender) on a
+  // dependent claim. Map to Stedi's M/F; omit gender entirely when unknown/unmappable
   // (docs allow omitting gender when unknown) while keeping dateOfBirth.
   const gender = genderCode(isDependent ? insurance.subscriber_gender : client.gender);
 

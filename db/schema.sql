@@ -364,6 +364,13 @@ create table if not exists insurance_records (
   subscriber_relationship  text,
   subscriber_name          text,
   subscriber_dob           date,
+  subscriber_address_line1 text,                              -- policyholder address (PHI); dependent claims only (CMS-1500 Box 7)
+  subscriber_address_line2 text,
+  subscriber_city          text,
+  subscriber_state         text,
+  subscriber_postal_code   text,
+  subscriber_gender        text                               -- policyholder gender (CMS-1500 Box 11a); same vocabulary as clients.gender
+                             check (subscriber_gender is null or subscriber_gender in ('female', 'male', 'unknown')),
   oon_deductible_total     numeric(12,2),
   oon_deductible_met       numeric(12,2),
   oon_reimbursement_rate   numeric(5,2),
@@ -392,6 +399,28 @@ create index if not exists idx_insurance_records_is_hidden on insurance_records 
 
 -- Migration (idempotent): add clearinghouse payer id to the live insurance_records table.
 alter table insurance_records add column if not exists payer_id varchar(50);
+
+-- Migration (idempotent): add the DEPENDENT-subscriber (policyholder) address +
+-- gender to the live insurance_records table. Required by some payers when the
+-- patient is a dependent on someone else's policy (837P subscriber loop; CMS-1500
+-- Box 7 / 11a). Optional — the Stedi adapter omits them from the built body when
+-- unset. See db/migrations/019_add_subscriber_demographics_prior_auth.sql.
+alter table insurance_records add column if not exists subscriber_address_line1 text;
+alter table insurance_records add column if not exists subscriber_address_line2 text;
+alter table insurance_records add column if not exists subscriber_city text;
+alter table insurance_records add column if not exists subscriber_state text;
+alter table insurance_records add column if not exists subscriber_postal_code text;
+alter table insurance_records add column if not exists subscriber_gender text;
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'insurance_records_subscriber_gender_check'
+  ) then
+    alter table insurance_records
+      add constraint insurance_records_subscriber_gender_check
+      check (subscriber_gender is null or subscriber_gender in ('female', 'male', 'unknown'));
+  end if;
+end $$;
 
 -- =============================================================================
 -- 7. sessions — therapy sessions (exist only to attach claims to).
@@ -461,6 +490,7 @@ create table if not exists claims (
                            check (submission_frequency_code is null or submission_frequency_code in ('1', '7')),
   payer_claim_control_number text,                            -- replacement (freq 7): payer's ORIGINAL claim number → 837P claim-level REF*F8
   corrects_claim_id      uuid references claims (id) on delete restrict,  -- self-ref: the claim this one replaces
+  prior_authorization_number text,                            -- CMS-1500 Box 23 / 837P claim-level REF*G1; claim-level, NOT on the policy
   clearinghouse          text,                                -- e.g. office_ally
   status                 text not null default 'draft'
                            check (status in ('draft', 'submitted', 'processing', 'info_requested',
@@ -533,6 +563,14 @@ begin
   end if;
 end $$;
 create index if not exists idx_claims_corrects_claim_id on claims (corrects_claim_id);
+
+-- Migration (idempotent): add the claim-level prior authorization number to the
+-- live claims table (CMS-1500 Box 23 / 837P claim-level REF*G1). Captured per
+-- claim in the submit flow and copied into the immutable submission context;
+-- deliberately NOT on insurance_records, since an authorization is specific to a
+-- course of treatment and would otherwise leak onto unrelated claims. See
+-- db/migrations/019_add_subscriber_demographics_prior_auth.sql.
+alter table claims add column if not exists prior_authorization_number text;
 
 -- =============================================================================
 -- 9. claim_events — status-history log per claim.

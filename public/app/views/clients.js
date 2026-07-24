@@ -108,6 +108,31 @@
       showIf: function (v) { return isDependentRel(v.subscriber_relationship); } },
     { name: 'subscriber_dob',          label: 'Policyholder date of birth', type: 'date',
       showIf: function (v) { return isDependentRel(v.subscriber_relationship); } },
+    { name: 'subscriber_gender',       label: 'Policyholder sex (as on the policy)', type: 'select',
+      options: [
+        { value: '',        label: '—' },
+        { value: 'female',  label: 'Female' },
+        { value: 'male',    label: 'Male' },
+        { value: 'unknown', label: 'Unknown' },
+      ],
+      hint: "The POLICYHOLDER's sex on the insurance policy — not the patient's. " +
+        'Some payers require it on a dependent claim (CMS-1500 Box 11a).',
+      showIf: function (v) { return isDependentRel(v.subscriber_relationship); } },
+    // Policyholder address (CMS-1500 Box 7). Distinct from the patient's own
+    // address — a dependent may live at a different address than the policyholder.
+    // A "same as patient" convenience checkbox is spliced in ahead of these in
+    // openForm (it needs the in-scope client's address to copy from).
+    { name: 'subscriber_address_line1', label: 'Policyholder address line 1', type: 'text',
+      hint: "The POLICYHOLDER's address — not the patient's. Leave blank if unknown.",
+      showIf: function (v) { return isDependentRel(v.subscriber_relationship); } },
+    { name: 'subscriber_address_line2', label: 'Policyholder address line 2', type: 'text',
+      showIf: function (v) { return isDependentRel(v.subscriber_relationship); } },
+    { name: 'subscriber_city',          label: 'Policyholder city',        type: 'text',
+      showIf: function (v) { return isDependentRel(v.subscriber_relationship); } },
+    { name: 'subscriber_state',         label: 'Policyholder state',       type: 'text',
+      showIf: function (v) { return isDependentRel(v.subscriber_relationship); } },
+    { name: 'subscriber_postal_code',   label: 'Policyholder ZIP',         type: 'text',
+      showIf: function (v) { return isDependentRel(v.subscriber_relationship); } },
     { name: 'oon_deductible_total',    label: 'OON deductible total',   type: 'number' },
     { name: 'oon_deductible_met',      label: 'OON deductible met',     type: 'number' },
     { name: 'oon_reimbursement_rate',  label: 'OON reimbursement rate (%)', type: 'number' },
@@ -628,9 +653,39 @@
         } else {
           values = { is_primary: 'true' };
         }
+        // "Same as patient" convenience for the policyholder address: a UI-only
+        // checkbox that copies THIS client's own address into the policyholder
+        // address fields. Built here (not in the static INSURANCE_FIELDS) so it can
+        // close over the in-scope `client`. Spliced in just before the address
+        // lines, and only visible in dependent mode.
+        var sameAsPatient = {
+          name: '_subscriber_addr_same_as_patient',
+          label: "Policyholder's address is the same as the patient's",
+          type: 'checkbox',
+          uiOnly: true,
+          showIf: function (v) { return isDependentRel(v.subscriber_relationship); },
+          onToggle: function (checked, controls) {
+            if (!checked) return;
+            var map = {
+              subscriber_address_line1: client.address_line1,
+              subscriber_address_line2: client.address_line2,
+              subscriber_city: client.city,
+              subscriber_state: client.state,
+              subscriber_postal_code: client.postal_code,
+            };
+            Object.keys(map).forEach(function (name) {
+              if (controls[name]) controls[name].value = map[name] || '';
+            });
+          },
+        };
+        var fields = [];
+        INSURANCE_FIELDS.forEach(function (f) {
+          if (f.name === 'subscriber_address_line1') fields.push(sameAsPatient);
+          fields.push(f);
+        });
         R.formModal({
           title: record ? 'Edit insurance' : 'Add insurance',
-          fields: INSURANCE_FIELDS,
+          fields: fields,
           values: values,
           submitLabel: record ? 'Save changes' : 'Add insurance',
         }).then(function (values) {
