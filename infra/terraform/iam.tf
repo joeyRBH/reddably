@@ -44,6 +44,21 @@ data "aws_iam_policy_document" "lambda_runtime" {
     ]
   }
 
+  # SSM Parameter Store - write/delete ONLY the per-connection Google Calendar
+  # refresh-token parameters (inbound calendar sync; see
+  # backend/handlers/calendar_oauth.js). The rest of the namespace stays
+  # read-only — the pre-existing statement above grants no Put/Delete anywhere.
+  statement {
+    sid = "SSMWriteGoogleRefreshTokens"
+    actions = [
+      "ssm:PutParameter",
+      "ssm:DeleteParameter",
+    ]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter${local.ssm_path_prefix}/google/refresh/*",
+    ]
+  }
+
   # KMS decrypt for SecureString parameters - only when a CMK is configured.
   # (Default SecureStrings use the AWS-managed aws/ssm key, which the parameter
   # owner can decrypt without an explicit grant.)
