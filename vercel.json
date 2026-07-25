@@ -7,6 +7,7 @@
     { "source": "/save-payment-method", "destination": "/api/save-payment-method" },
     { "source": "/clients/:id/send-payment-link", "destination": "/api/clients/:id/send-payment-link" },
     { "source": "/subscription/vob/activate", "destination": "/api/vob-activate" },
+    { "source": "/integrations/google/callback", "destination": "https://api.claimsub.com/integrations/google/callback" },
     { "source": "/card-setup", "destination": "/card-setup.html" }
   ]
 }
