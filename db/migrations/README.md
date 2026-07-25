@@ -77,3 +77,14 @@ done
   the submit handler enforces the safety gate, and `backend/lib/clearinghouse/stedi.js`
   emits `claimFrequencyCode '7'` + `claimSupplementalInformation.claimControlNumber`.
   Frequency 7 ONLY — void (`8`) is a separate later change.
+- `020_add_calendar_sync_tables.sql` — adds `calendar_connections` (one authorized
+  Google calendar per clinician: OAuth + sync state; refresh token stored only as
+  KMS ciphertext, access tokens never stored; no PHI) and `calendar_events`
+  (staged inbound events + match state, one row per Google event per connection;
+  `summary_raw` is PHI), plus `sessions.source` (`'manual'` | `'calendar'`,
+  default `'manual'`) for provenance. Powers the INBOUND, read-only
+  Google Calendar → SC sync (EHR → Google → SC; SimplePractice pilot) — unrelated
+  to the outbound de-identified ICS feed (migration 011). Events never write into
+  `sessions` directly: a row is promoted to a session only on explicit human
+  confirmation, so a fuzzy name match can never create a billable session on its
+  own.
