@@ -349,6 +349,13 @@
       });
     },
     refresh: function (id) { return request('POST', '/claims/' + id + '/refresh', {}); },
+    // Resolve a claim whose submission attempt never confirmed (submitted, no
+    // control number). No payload: look it up at the clearinghouse by patient
+    // control number and adopt the real status. payload { resolution:
+    // 'received', control_number } or { resolution: 'not_received' } records an
+    // operator's decision after checking the clearinghouse dashboard. NOTE: no
+    // fee is charged here — the fee only rides the normal submit path.
+    reconcile: function (id, payload) { return request('POST', '/claims/' + id + '/reconcile', payload || {}); },
     void: function (id) { return request('POST', '/claims/' + id + '/void', {}); },
     // Recompute a draft/denied claim's session-derived fields (billed amount)
     // after its underlying session was edited. Server-side; no client-side math.

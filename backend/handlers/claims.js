@@ -12,6 +12,7 @@
 //   DELETE /claims/{id}            → soft-delete (draft/void only)
 //   POST   /claims/{id}/submit     → submit via the clearinghouse adapter
 //   POST   /claims/{id}/refresh    → poll the clearinghouse for status + amounts
+//   POST   /claims/{id}/reconcile  → resolve an unconfirmed submission attempt
 //   POST   /claims/{id}/void       → mark the claim void
 //   GET    /claims/{id}/events     → the claim's status-history (claim_events)
 //
@@ -50,6 +51,34 @@ const CLAIM_STATUSES = [
 // not replacement; `draft`/`void` were never accepted. Frequency 7 ONLY — void
 // (frequency 8) is a separate, later capability.
 const REPLACEABLE_STATUSES = ['submitted', 'processing', 'info_requested', 'appealed', 'paid'];
+
+// Submission attempted, outcome never confirmed. The submit path records the
+// attempt (status 'submitted', clearinghouse set) BEFORE the network call; the
+// control number is only filled in by the clearinghouse's acknowledgment. So
+// 'submitted' with NO control number means exactly one thing: the claim was
+// handed to the network and we never saw the answer (Lambda killed, timeout,
+// connection dropped). Every claim whose submission WAS confirmed got its
+// control number in the same UPDATE that set 'submitted', so the sentinel is
+// unambiguous. A claim in this state must never be resubmitted blindly — the
+// clearinghouse may well have accepted it (that is what happened in the
+// 2026-07-26 incident) — it is resolved through POST /claims/{id}/reconcile.
+function submissionOutcomeUnknown(claim) {
+  return !!claim && claim.status === 'submitted' && claim.control_number == null;
+}
+
+// Failure class for clearinghouse-call logging: a coarse, PHI-free label of WHY
+// the call failed (never the message text, request, or response — those can echo
+// submitted PHI). This is what makes a dead submit attempt visible in CloudWatch:
+// the incident Lambda timed out with zero application logs.
+function clearinghouseFailureClass(err) {
+  if (err && err.isRejection) return 'rejection';
+  const msg = err && err.message ? String(err.message) : '';
+  if (/timed out/i.test(msg)) return 'timeout';
+  const m = msg.match(/HTTP (\d{3})/);
+  if (m) return `http_${m[1]}`;
+  if (/fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|socket|network/i.test(msg)) return 'network';
+  return 'error';
+}
 
 // A claim carries replacement (frequency 7) intent when the durable frequency code
 // says so, or when it references the claim it replaces. Either alone is enough to
@@ -719,6 +748,15 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   if (!isUUID(id)) return json(404, { error: 'Not found' }, event);
   const claim = await loadClaim(practiceId, id);
   if (!claim) return json(404, { error: 'Not found' }, event);
+  // Unsafe-retry guard: a prior attempt on this claim never confirmed its
+  // outcome, so the clearinghouse may already hold it. Resubmitting now could
+  // file a duplicate — refuse with the remedy, never a generic status error.
+  if (submissionOutcomeUnknown(claim)) {
+    return json(409, {
+      error: 'A previous submission attempt for this claim was never confirmed — the clearinghouse may already have it. Reconcile the claim with the clearinghouse first; resubmitting now could file a duplicate.',
+      outcome: 'unknown',
+    }, event);
+  }
   if (claim.status !== 'draft') {
     return json(409, { error: 'Only draft claims can be submitted.' }, event);
   }
@@ -885,46 +923,133 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
     });
   }
 
-  let result;
-  try {
-    result = await adapter.submitClaim(ctx);
-  } catch (err) {
-    // A clearinghouse *rejection* (e.g. Stedi error 33 — invalid control number)
-    // carries a human-readable reason: surface it as a 422 the way VOB AAA
-    // rejections are surfaced, so the user sees the description, not a bare 502.
-    // The description is not logged (it may echo submitted PHI).
-    if (err && err.isRejection) {
-      return json(422, { error: err.message, rejection: err.rejection || null }, event);
-    }
-    console.error('claims submit (clearinghouse) error:', err && err.message);
-    return json(502, { error: 'Clearinghouse submission failed.' }, event);
-  }
-
   // The frequency actually submitted, persisted durably on the claim (the
   // submission record) so we can always explain what was sent — '7' for a
   // replacement (already stored, reaffirmed here), '1' for an ordinary original.
   const submittedFrequency = isReplacementClaim(claim) ? '7' : '1';
 
-  const updated = await db.withTransaction(async (client) => {
+  // Record the submission attempt BEFORE the network call. The claim moves to
+  // 'submitted' with control_number NULL (= outcome unknown, see
+  // submissionOutcomeUnknown) carrying everything about what is being sent —
+  // clearinghouse, frequency, prior auth; the patient control number was already
+  // persisted above. If the Lambda dies mid-call, times out, or the connection
+  // drops, the claim is left in a state that BLOCKS retry and demands
+  // reconciliation — never a failed-looking state that invites a duplicate. This
+  // is the fix for the 2026-07-26 incident, where a submit that timed out had
+  // actually been ACCEPTED by the clearinghouse while the claim still read as
+  // unsubmitted. The status='draft' gate doubles as the concurrent-submit guard.
+  const pending = await db.withTransaction(async (client) => {
     const res = await client.query(
       `update claims
           set status = 'submitted',
               submitted_at = now(),
-              control_number = $1,
+              control_number = null,
+              clearinghouse = $1,
+              submission_frequency_code = $2,
+              prior_authorization_number = $3
+        where id = $4 and practice_id = $5 and is_hidden = false and status = 'draft'
+        returning *`,
+      [
+        adapter.name,
+        submittedFrequency,
+        cleanText(claim.prior_authorization_number),
+        id,
+        practiceId,
+      ]
+    );
+    if (res.rowCount === 0) return null;
+    await logEvent(client, {
+      practiceId,
+      claimId: id,
+      createdBy: userId,
+      eventType: 'note',
+      statusFrom: 'draft',
+      statusTo: 'submitted',
+      note: 'Submission attempt recorded; transmitting to clearinghouse.',
+    });
+    return res.rows[0];
+  });
+  if (!pending) return json(409, { error: 'Claim is no longer in a submittable state.' }, event);
+
+  // Breadcrumb BEFORE the call: even if the Lambda is hard-killed mid-request
+  // (the incident produced zero application logs), CloudWatch shows which claim
+  // was in flight. Ids only — never PHI, never the 837P payload.
+  console.log(`claims submit: transmitting claim ${id} via ${adapter.name}`);
+
+  let result;
+  try {
+    result = await adapter.submitClaim(ctx);
+  } catch (err) {
+    // Ids + failure class only — the message/response can echo submitted PHI.
+    console.error(`claims submit: clearinghouse call failed (claim ${id}, class ${clearinghouseFailureClass(err)})`);
+
+    // A clearinghouse *rejection* (e.g. Stedi error 33 — invalid control number)
+    // is a CONFIRMED outcome: the clearinghouse received the claim and refused
+    // it, so nothing was filed. Return the claim to draft (so it can be fixed
+    // and resubmitted, reusing the same patient control number) and surface the
+    // reason as a 422 the way VOB AAA rejections are surfaced. The description
+    // is not logged (it may echo submitted PHI).
+    if (err && err.isRejection) {
+      await db.withTransaction(async (client) => {
+        const res = await client.query(
+          `update claims set status = 'draft', submitted_at = null
+            where id = $1 and practice_id = $2 and is_hidden = false
+              and status = 'submitted' and control_number is null
+            returning id`,
+          [id, practiceId]
+        );
+        if (res.rowCount > 0) {
+          await logEvent(client, {
+            practiceId,
+            claimId: id,
+            createdBy: userId,
+            eventType: 'note',
+            statusFrom: 'submitted',
+            statusTo: 'draft',
+            note: 'Clearinghouse rejected the submission; claim returned to draft.',
+          });
+        }
+      });
+      return json(422, { error: err.message, rejection: err.rejection || null }, event);
+    }
+
+    // Anything else — timeout, network failure, an opaque 5xx — is an UNKNOWN
+    // outcome: the claim may or may not have been received (in the incident it
+    // WAS accepted). Leave the pending record exactly as written above so retry
+    // stays blocked, and tell the user to reconcile, not retry. The event write
+    // is best-effort: if it fails the claim is already in the safe state.
+    try {
+      await db.withTransaction(async (client) => {
+        await logEvent(client, {
+          practiceId,
+          claimId: id,
+          createdBy: userId,
+          eventType: 'note',
+          note: `Submission outcome unknown (${clearinghouseFailureClass(err)}). Do not resubmit — reconcile with the clearinghouse first.`,
+        });
+      });
+    } catch (_) { /* claim already safely blocked; the 502 below still stands */ }
+    return json(502, {
+      error: 'The clearinghouse did not confirm this submission — the claim may still have been received. Do not resubmit; reconcile the claim to adopt its real status.',
+      outcome: 'unknown',
+    }, event);
+  }
+
+  // Confirmed accepted: fill in the acknowledgment. The WHERE clause targets
+  // exactly the pending record written above (submitted + no control number).
+  const updated = await db.withTransaction(async (client) => {
+    const res = await client.query(
+      `update claims
+          set control_number = $1,
               claim_number = coalesce(claim_number, $2),
-              clearinghouse = $3,
-              clearinghouse_payload = $4,
-              submission_frequency_code = $5,
-              prior_authorization_number = $6
-        where id = $7 and practice_id = $8 and is_hidden = false and status = 'draft'
+              clearinghouse_payload = $3
+        where id = $4 and practice_id = $5 and is_hidden = false
+          and status = 'submitted' and control_number is null
         returning *`,
       [
         cleanText(result.control_number),
         cleanText(result.claim_number),
-        adapter.name,
         result.raw != null ? JSON.stringify(result.raw) : null,
-        submittedFrequency,
-        cleanText(claim.prior_authorization_number),
         id,
         practiceId,
       ]
@@ -960,7 +1085,14 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
     return row;
   });
 
-  if (!updated) return json(409, { error: 'Claim is no longer in a submittable state.' }, event);
+  // The pending record vanished mid-call (e.g. voided concurrently). The
+  // clearinghouse HAS the claim but our row no longer matches — reconciliation
+  // is the only safe path from here, so say so rather than a generic error.
+  if (!updated) {
+    return json(409, {
+      error: 'Claim state changed while the submission was in flight. Reconcile the claim with the clearinghouse before taking further action.',
+    }, event);
+  }
   await audit(event, authCtx, {
     action: 'claim.submit',
     resourceType: 'claim',
@@ -974,11 +1106,214 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   return json(200, { claim: shapeClaim(updated) }, event);
 }
 
+// POST /claims/{id}/reconcile — resolve a claim whose submission attempt never
+// confirmed (status 'submitted', no control number; see submissionOutcomeUnknown).
+// Three modes, all practice-scoped and all gated on that exact state:
+//
+//   (default, no body)             Look the claim up at the clearinghouse by its
+//                                  patient control number and ADOPT the real
+//                                  status. A no-match does NOT touch the claim —
+//                                  a payer that hasn't indexed a minutes-old
+//                                  claim also answers "not found", and reverting
+//                                  on that would re-enable the duplicate.
+//   { resolution: 'received',      Operator checked the clearinghouse dashboard
+//     control_number }             and confirmed the claim WAS accepted: record
+//                                  its control number, claim stays 'submitted'.
+//   { resolution: 'not_received' } Operator confirmed it never arrived: return
+//                                  the claim to draft. The patient control
+//                                  number is retained, so a resubmission reuses
+//                                  it and the clearinghouse can recognize a
+//                                  duplicate even if the operator was wrong.
+async function reconcileClaim(practiceId, userId, id, body, event, authCtx) {
+  if (!isUUID(id)) return json(404, { error: 'Not found' }, event);
+  const claim = await loadClaim(practiceId, id);
+  if (!claim) return json(404, { error: 'Not found' }, event);
+  if (!submissionOutcomeUnknown(claim)) {
+    return json(409, { error: 'Only a claim with an unconfirmed submission attempt can be reconciled.' }, event);
+  }
+
+  const resolution = cleanText(body && body.resolution);
+  if (resolution != null && resolution !== 'received' && resolution !== 'not_received') {
+    return json(400, { error: "Invalid resolution. Expected 'received' or 'not_received'." }, event);
+  }
+
+  if (resolution === 'not_received') {
+    const updated = await db.withTransaction(async (client) => {
+      const res = await client.query(
+        `update claims set status = 'draft', submitted_at = null
+          where id = $1 and practice_id = $2 and is_hidden = false
+            and status = 'submitted' and control_number is null
+          returning *`,
+        [id, practiceId]
+      );
+      if (res.rowCount === 0) return null;
+      await logEvent(client, {
+        practiceId,
+        claimId: id,
+        createdBy: userId,
+        eventType: 'note',
+        statusFrom: 'submitted',
+        statusTo: 'draft',
+        note: 'Operator confirmed the clearinghouse never received this claim; returned to draft. The patient control number is retained for resubmission.',
+      });
+      return res.rows[0];
+    });
+    if (!updated) return json(409, { error: 'Claim is no longer awaiting reconciliation.' }, event);
+    await audit(event, authCtx, {
+      action: 'claim.reconcile',
+      resourceType: 'claim',
+      resourceId: id,
+      metadata: { outcome: 'not_received' },
+    });
+    return json(200, {
+      claim: shapeClaim(updated),
+      outcome: 'reverted',
+      message: 'Claim returned to draft. Resubmitting reuses the same patient control number.',
+    }, event);
+  }
+
+  if (resolution === 'received') {
+    // The clearinghouse-assigned control number, read off its dashboard. Required:
+    // without it the claim would stay in the unknown state this endpoint resolves.
+    const controlNumber = cleanText(body && body.control_number);
+    if (!controlNumber) {
+      return json(400, { error: "control_number (from the clearinghouse) is required when resolution is 'received'." }, event);
+    }
+    const updated = await db.withTransaction(async (client) => {
+      const res = await client.query(
+        `update claims set control_number = $1
+          where id = $2 and practice_id = $3 and is_hidden = false
+            and status = 'submitted' and control_number is null
+          returning *`,
+        [controlNumber, id, practiceId]
+      );
+      if (res.rowCount === 0) return null;
+      await logEvent(client, {
+        practiceId,
+        claimId: id,
+        createdBy: userId,
+        eventType: 'note',
+        note: 'Operator confirmed the clearinghouse received this claim; its control number was recorded.',
+      });
+      return res.rows[0];
+    });
+    if (!updated) return json(409, { error: 'Claim is no longer awaiting reconciliation.' }, event);
+    await audit(event, authCtx, {
+      action: 'claim.reconcile',
+      resourceType: 'claim',
+      resourceId: id,
+      metadata: { outcome: 'received' },
+    });
+    return json(200, {
+      claim: shapeClaim(updated),
+      outcome: 'adopted',
+      message: 'Submission confirmed; the claim is now tracked as submitted.',
+    }, event);
+  }
+
+  // Default: ask the clearinghouse. The lookup matches on the patient control
+  // number the pending attempt persisted before transmitting.
+  const pcn = cleanText(claim.patient_control_number);
+  if (!pcn) {
+    return json(409, { error: 'Claim has no patient control number to reconcile by.' }, event);
+  }
+  const adapter = getClearinghouse();
+  if (typeof adapter.reconcileSubmission !== 'function') {
+    return json(409, {
+      error: "The configured clearinghouse does not support automatic reconciliation. Check its dashboard, then reconcile with resolution 'received' or 'not_received'.",
+    }, event);
+  }
+
+  const ctx = await buildClaimContext(practiceId, claim);
+  let result;
+  try {
+    result = await adapter.reconcileSubmission({ ctx, patientControlNumber: pcn });
+  } catch (err) {
+    // Ids + failure class only — never PHI, never the request/response payload.
+    console.error(`claims reconcile: clearinghouse call failed (claim ${id}, class ${clearinghouseFailureClass(err)})`);
+    return json(502, { error: 'Clearinghouse reconciliation lookup failed.' }, event);
+  }
+
+  if (!result || result.found !== true) {
+    // No match is NOT evidence the claim never arrived — leave the claim blocked.
+    await audit(event, authCtx, {
+      action: 'claim.reconcile',
+      resourceType: 'claim',
+      resourceId: id,
+      metadata: { outcome: 'no_match' },
+    });
+    return json(200, {
+      claim: shapeClaim(claim),
+      outcome: 'no_match',
+      message: "The clearinghouse returned no match for this claim yet. If its dashboard confirms the claim was never received, reconcile again with resolution 'not_received'.",
+    }, event);
+  }
+
+  const newStatus = result.status;
+  if (!CLAIM_STATUSES.includes(newStatus)) {
+    console.error('claims reconcile: adapter returned unknown status');
+    return json(502, { error: 'Clearinghouse returned an unrecognized status.' }, event);
+  }
+
+  const updated = await db.withTransaction(async (client) => {
+    const res = await client.query(
+      `update claims
+          set status = $1,
+              control_number = coalesce($2, control_number)
+        where id = $3 and practice_id = $4 and is_hidden = false
+          and status = 'submitted' and control_number is null
+        returning *`,
+      [newStatus, cleanText(result.control_number), id, practiceId]
+    );
+    if (res.rowCount === 0) return null;
+    const row = res.rows[0];
+    await logEvent(client, {
+      practiceId,
+      claimId: row.id,
+      createdBy: userId,
+      eventType: eventTypeForStatus(newStatus),
+      statusFrom: 'submitted',
+      statusTo: newStatus,
+      note: 'Reconciled with the clearinghouse; adopted its status for the earlier unconfirmed submission.',
+      payload: result.raw,
+    });
+    // Store the reconciliation payload verbatim like any other status response —
+    // passive dataset, stored, never acted on. No-op without a raw payload.
+    await logAck(client, {
+      practiceId,
+      claimId: row.id,
+      source: adapter.name,
+      kind: 'status',
+      controlNumber: pcn,
+      payload: result.raw,
+    });
+    return row;
+  });
+  if (!updated) return json(409, { error: 'Claim is no longer awaiting reconciliation.' }, event);
+  await audit(event, authCtx, {
+    action: 'claim.reconcile',
+    resourceType: 'claim',
+    resourceId: id,
+    metadata: { outcome: 'adopted', status: updated.status },
+  });
+  return json(200, {
+    claim: shapeClaim(updated),
+    outcome: 'adopted',
+    message: 'Clearinghouse status adopted.',
+  }, event);
+}
+
 async function refreshClaim(practiceId, userId, id, event, authCtx) {
   if (!isUUID(id)) return json(404, { error: 'Not found' }, event);
   const claim = await loadClaim(practiceId, id);
   if (!claim) return json(404, { error: 'Not found' }, event);
   if (!claim.control_number) {
+    if (submissionOutcomeUnknown(claim)) {
+      return json(409, {
+        error: 'This claim has an unconfirmed submission attempt. Reconcile it with the clearinghouse first.',
+        outcome: 'unknown',
+      }, event);
+    }
     return json(409, { error: 'Claim has not been submitted to a clearinghouse.' }, event);
   }
 
@@ -1276,6 +1611,8 @@ exports.ageInYears = ageInYears;
 exports.REGENERATABLE_STATUSES = REGENERATABLE_STATUSES;
 exports.REPLACEABLE_STATUSES = REPLACEABLE_STATUSES;
 exports.isReplacementClaim = isReplacementClaim;
+exports.submissionOutcomeUnknown = submissionOutcomeUnknown;
+exports.clearinghouseFailureClass = clearinghouseFailureClass;
 // Pure shapers exported for unit testing (no DB / network).
 exports.shapeClaim = shapeClaim;
 exports.shapeClaimDetail = shapeClaimDetail;
@@ -1310,6 +1647,7 @@ exports.handler = async (event) => {
     if (action === 'submit' && method === 'POST' && id) return await submitClaim(practiceId, userId, id, body, event, authCtx);
     if (action === 'replace' && method === 'POST' && id) return await replaceClaim(practiceId, userId, id, body, event, authCtx);
     if (action === 'refresh' && method === 'POST' && id) return await refreshClaim(practiceId, userId, id, event, authCtx);
+    if (action === 'reconcile' && method === 'POST' && id) return await reconcileClaim(practiceId, userId, id, body, event, authCtx);
     if (action === 'void' && method === 'POST' && id) return await voidClaim(practiceId, userId, id, event, authCtx);
     if (action === 'regenerate' && method === 'POST' && id) return await regenerateClaim(practiceId, userId, id, event, authCtx);
     if (action === 'events' && method === 'GET' && id) return await listEvents(practiceId, id, event);

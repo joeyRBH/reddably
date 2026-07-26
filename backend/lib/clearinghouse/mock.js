@@ -42,4 +42,22 @@ async function getStatus({ control_number, claim }) {
   };
 }
 
-module.exports = { name, submitClaim, getStatus };
+// Reconciliation lookup for a submission whose outcome was never confirmed.
+// The mock always "finds" the claim as accepted, so the reconcile flow — adopt
+// the clearinghouse's status for a pending claim — is exercisable end-to-end.
+async function reconcileSubmission({ patientControlNumber }) {
+  const control = `MOCK-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+  return {
+    found: true,
+    status: 'submitted',
+    control_number: control,
+    raw: {
+      adapter: name,
+      event: 'reconcile',
+      patient_control_number: patientControlNumber || null,
+      control_number: control,
+    },
+  };
+}
+
+module.exports = { name, submitClaim, getStatus, reconcileSubmission };
