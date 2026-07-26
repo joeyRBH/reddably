@@ -29,6 +29,7 @@ const {
   sessionHasActiveClaim,
   insertDraftClaim,
 } = require('../lib/claims');
+const { PLACE_OF_SERVICE_CODES, isValidPlaceOfService } = require('../lib/place_of_service');
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -154,6 +155,24 @@ function parseProcedureModifiers(v) {
   return { ok: true, value: out.length === 0 ? null : out };
 }
 
+// Optional place of service (837P 2300/CLM05-01 / CMS-1500 Box 24B): absent/blank
+// → null (a session may be saved before billing details are known — exactly what
+// calendar-promoted sessions do). Otherwise the trimmed value must be one of the
+// two-character CMS codes in lib/place_of_service.js — a free-text value like
+// "office" is what got a live claim rejected by the payer ("CLM-05-01 cannot
+// exceed 2 characters").
+function parsePlaceOfService(v) {
+  const s = cleanText(v);
+  if (s == null) return { ok: true, value: null };
+  if (!isValidPlaceOfService(s)) return { ok: false };
+  return { ok: true, value: s };
+}
+
+function placeOfServiceError() {
+  const allowed = PLACE_OF_SERVICE_CODES.map((e) => `${e.code} (${e.label})`).join(', ');
+  return `Invalid place_of_service. Expected one of: ${allowed}.`;
+}
+
 // --- shaping -----------------------------------------------------------------
 
 function shapeSession(r) {
@@ -270,7 +289,11 @@ async function createSession(practiceId, body, event, authCtx) {
 
   // Column values shared by every session in the (possibly singleton) series.
   const cptCode = cleanText(body.cpt_code);
-  const placeOfService = cleanText(body.place_of_service);
+  const pos = parsePlaceOfService(body.place_of_service);
+  if (!pos.ok) {
+    return json(400, { error: placeOfServiceError() }, event);
+  }
+  const placeOfService = pos.value;
   const notes = cleanText(body.notes);
 
   if (recurrence === 'none') {
@@ -493,8 +516,16 @@ async function updateSession(practiceId, userId, id, body, event, authCtx) {
     add('duration_minutes', duration.value);
   }
 
-  for (const col of ['cpt_code', 'place_of_service', 'notes']) {
+  for (const col of ['cpt_code', 'notes']) {
     if (col in body) add(col, cleanText(body[col]));
+  }
+
+  if ('place_of_service' in body) {
+    const pos = parsePlaceOfService(body.place_of_service);
+    if (!pos.ok) {
+      return json(400, { error: placeOfServiceError() }, event);
+    }
+    add('place_of_service', pos.value);
   }
 
   if ('diagnosis_codes' in body) {
