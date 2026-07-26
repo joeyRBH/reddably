@@ -42,7 +42,7 @@ resource "aws_lambda_function" "auth" {
   for_each = local.lambda_functions
 
   function_name = "${local.prefix}-${each.key}"
-  description   = "Claimsub handler ${each.key}: ${join(", ", [for r in each.value.routes : "${r.method} /${r.path}"])}"
+  description   = "Claimsub handler ${each.key}"
 
   role    = aws_iam_role.lambda_exec.arn
   runtime = var.lambda_runtime
