@@ -50,7 +50,7 @@ ssmLib.deleteParameter = async (name) => {
 
 const dbLib = require(path.join(__dirname, '..', 'lib', 'db.js'));
 
-const state = { connections: [], events: [] };
+const state = { connections: [], events: [], clients: [] };
 let seq = 0;
 
 function applyEventUpsert(text, params) {
@@ -136,6 +136,36 @@ dbLib.query = async (text, params) => {
   }
   if (/insert into calendar_events/.test(t)) {
     return applyEventUpsert(t, params);
+  }
+  // Post-upsert matching pass (lib/calendar_match wiring). state.clients stays
+  // empty in these tests, so no row is ever staged 'matched' here — matching
+  // itself is covered by calendar_match.test.js.
+  if (/select id, summary_raw from calendar_events/.test(t)) {
+    const rows = state.events.filter(
+      (r) =>
+        r.connection_id === params[0] &&
+        r.match_state === 'unmatched' &&
+        r.event_status !== 'cancelled'
+    );
+    return { rows, rowCount: rows.length };
+  }
+  if (/select id, first_name, last_name, preferred_name from clients/.test(t)) {
+    return { rows: state.clients, rowCount: state.clients.length };
+  }
+  if (/update calendar_events\s+set match_state = 'matched'/.test(t)) {
+    const row = state.events.find((r) => r.id === params[0] && r.match_state === 'unmatched');
+    if (row) {
+      row.match_state = 'matched';
+      row.matched_client_id = params[1];
+      row.match_confidence = params[2];
+      row.match_reason = params[3];
+    }
+    return { rows: [], rowCount: row ? 1 : 0 };
+  }
+  if (/update calendar_events\s+set match_reason = 'ambiguous'/.test(t)) {
+    const row = state.events.find((r) => r.id === params[0] && r.match_state === 'unmatched');
+    if (row) row.match_reason = 'ambiguous';
+    return { rows: [], rowCount: row ? 1 : 0 };
   }
   if (/update calendar_events\s+set event_status\s+= 'cancelled'/.test(t)) {
     const row = state.events.find(
