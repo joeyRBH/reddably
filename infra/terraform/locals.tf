@@ -173,6 +173,17 @@ locals {
         { method = "POST", path = "integrations/google/sync" },
       ]
     }
+    calendar_events = {
+      handler = "handlers/calendar_events.handler"
+      # Staged inbound calendar events: review list + explicit human promotion to
+      # a sessions row (the fee-relevant step — a name match alone never creates
+      # one) + ignore. Practice-scoped; distinct from /calendar/* (outbound ICS).
+      routes = [
+        { method = "GET", path = "calendar-events" },
+        { method = "POST", path = "calendar-events/{id}/promote" },
+        { method = "POST", path = "calendar-events/{id}/ignore" },
+      ]
+    }
     vob = {
       handler = "handlers/vob.handler"
       routes = [

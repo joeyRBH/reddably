@@ -1,8 +1,11 @@
 'use strict';
 
-// INBOUND Google Calendar -> calendar_events ingestion. Ingestion ONLY: no
-// matching, no promotion to sessions, no UI — every new row lands with the
-// column-default match_state 'unmatched' and a human decides later.
+// INBOUND Google Calendar -> calendar_events ingestion + name matching. Every
+// new row lands with the column-default match_state 'unmatched'; after the
+// upsert pass, still-unmatched rows are run through lib/calendar_match against
+// the practice's active clients and a single unambiguous hit is staged as
+// match_state 'matched' — a SUGGESTION only. Promotion to a sessions row
+// happens exclusively on explicit human confirmation (handlers/calendar_events).
 //
 // Deliberately simple (one-practice pilot): a fixed now-30d .. now+60d window
 // on every run, no sync tokens, no caching, no scheduling, no retry framework.
@@ -19,6 +22,7 @@
 const db = require('./db');
 const ssm = require('./ssm');
 const google = require('./google_oauth');
+const { matchEvent } = require('./calendar_match');
 
 // Must mirror handlers/calendar_oauth.js (REFRESH_SSM_PREFIX) — both derive the
 // parameter path from the connection row id.
@@ -167,6 +171,58 @@ async function upsertEvent(conn, item) {
   };
 }
 
+// --- name matching ----------------------------------------------------------------
+
+// Run the matcher over this connection's rows still in match_state 'unmatched'
+// (cancelled events skipped), against the practice's active clients. A single
+// unambiguous hit stages the row as 'matched'; an ambiguous title records
+// match_reason 'ambiguous' and stays 'unmatched'. Every UPDATE re-checks
+// match_state = 'unmatched' in its WHERE so a row a human meanwhile confirmed
+// or ignored is never overwritten. summary_raw is PHI and never leaves the
+// query results — nothing here logs it, and match_reason only ever names a
+// format ('full_name', ..., 'ambiguous').
+async function matchUnmatchedEvents(conn) {
+  const pending = await db.query(
+    `select id, summary_raw from calendar_events
+      where connection_id = $1
+        and match_state = 'unmatched'
+        and event_status <> 'cancelled'`,
+    [conn.id]
+  );
+  if (pending.rowCount === 0) return;
+
+  const candidates = await db.query(
+    `select id, first_name, last_name, preferred_name from clients
+      where practice_id = $1 and is_hidden = false and status <> 'inactive'`,
+    [conn.practice_id]
+  );
+  if (candidates.rowCount === 0) return;
+
+  for (const row of pending.rows) {
+    const hit = matchEvent(row.summary_raw, candidates.rows);
+    if (!hit) continue;
+    if (hit.clientId) {
+      await db.query(
+        `update calendar_events
+            set match_state = 'matched',
+                matched_client_id = $2,
+                match_confidence = $3,
+                match_reason = $4
+          where id = $1 and match_state = 'unmatched'`,
+        [row.id, hit.clientId, hit.confidence, hit.reason]
+      );
+    } else {
+      // Ambiguous: >1 candidate at the top tier. Record why, resolve nothing.
+      await db.query(
+        `update calendar_events
+            set match_reason = 'ambiguous'
+          where id = $1 and match_state = 'unmatched'`,
+        [row.id]
+      );
+    }
+  }
+}
+
 // --- error classification --------------------------------------------------------
 
 // invalid_grant (revoked/expired refresh token) or a 401 from the events API:
@@ -213,6 +269,8 @@ async function syncConnection(connectionId) {
       else if (r.op === 'updated') counts.updated += 1;
       if (r.cancelled) counts.cancelled += 1;
     }
+
+    await matchUnmatchedEvents(conn);
 
     await db.query(
       `update calendar_connections

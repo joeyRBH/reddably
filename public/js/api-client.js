@@ -391,6 +391,23 @@
     regenerate: function () { return request('POST', '/calendar/regenerate', {}); },
   };
 
+  // Staged inbound calendar events (review + promotion to sessions).
+  //   list(filters)        -> { calendar_events: [...] }  filters: { state, from, to }
+  //   promote(id, clientId)-> { session, calendar_event } (idempotent; creates the
+  //                           sessions row on explicit confirmation only)
+  //   ignore(id)           -> { ignored: true }  (reversible via promote)
+  //   sync()               -> { connections, totals }  (pulls fresh events in;
+  //                           the path names the provider internally — UI text
+  //                           stays white-labeled as "Calendar" / "Sync now")
+  var calendarEvents = {
+    list: function (filters) { return request('GET', '/calendar-events' + buildQuery(filters)); },
+    promote: function (id, clientId) {
+      return request('POST', '/calendar-events/' + id + '/promote', { client_id: clientId });
+    },
+    ignore: function (id) { return request('POST', '/calendar-events/' + id + '/ignore', {}); },
+    sync: function () { return request('POST', '/integrations/google/sync', {}); },
+  };
+
   // Subscription / plan (Instant VOB add-on).
   //   status()      -> { plan, vob_checks_used, vob_period_start }  (Lambda API; DB-only)
   //   activateVob() -> { checkoutUrl }  (Vercel function; Stripe egress) — redirect there
@@ -499,6 +516,7 @@
     practice: practice,
     invitations: invitations,
     calendar: calendar,
+    calendarEvents: calendarEvents,
     billing: billing,
     subscription: subscription,
     vob: vob,
