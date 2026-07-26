@@ -147,8 +147,9 @@ locals {
     }
     calendar_oauth = {
       handler = "handlers/calendar_oauth.handler"
-      # INBOUND Google Calendar sync — OAuth connect/disconnect only (no event
-      # fetching yet). /callback is reached by a browser redirect from Google
+      # INBOUND Google Calendar sync — OAuth connect/disconnect + calendar
+      # selection (no event fetching; that is calendar_sync). /callback is
+      # reached by a browser redirect from Google
       # (proxied through the app domain via vercel.json) and authenticates by
       # the signed short-lived `state` from /start, not a Bearer header.
       # Refresh tokens live in SSM SecureStrings keyed by connection id — see
@@ -158,6 +159,8 @@ locals {
         { method = "GET", path = "integrations/google/callback" },
         { method = "GET", path = "integrations/google/status" },
         { method = "POST", path = "integrations/google/disconnect" },
+        { method = "GET", path = "integrations/google/calendars" },
+        { method = "PATCH", path = "integrations/google/connections/{id}" },
       ]
     }
     calendar_sync = {

@@ -1,13 +1,16 @@
 'use strict';
 
-// INBOUND Google Calendar sync — OAuth connect/disconnect flow ONLY (no event
-// fetching, no matching, no promotion; later changes). One Lambda routed
-// internally by the trailing path segment, like the other resources:
+// INBOUND Google Calendar sync — OAuth connect/disconnect flow + calendar
+// selection (no event fetching, no matching, no promotion; other Lambdas). One
+// Lambda routed internally by the trailing path segment, like the other
+// resources:
 //
-//   GET  /integrations/google/start       → 302 to the Google consent URL
-//   GET  /integrations/google/callback    → code exchange + connection upsert
-//   GET  /integrations/google/status      → the caller's connections (no tokens)
-//   POST /integrations/google/disconnect  → status 'disconnected' + token cleanup
+//   GET   /integrations/google/start            → 302 to the Google consent URL
+//   GET   /integrations/google/callback         → code exchange + connection upsert
+//   GET   /integrations/google/status           → the caller's connections (no tokens)
+//   POST  /integrations/google/disconnect       → status 'disconnected' + token cleanup
+//   GET   /integrations/google/calendars        → the connected account's calendars
+//   PATCH /integrations/google/connections/{id} → switch which calendar syncs
 //
 // Unrelated to the OUTBOUND de-identified ICS feed (handlers/calendar.js) —
 // these routes live under /integrations/google/* to avoid any collision.
@@ -139,6 +142,19 @@ function action(event) {
     (event && event.rawPath) || '';
   m = path.match(/\/integrations\/google\/([a-z]+)\/?$/i);
   return m ? m[1].toLowerCase() : null;
+}
+
+// {id} of /integrations/google/connections/{id}: the API Gateway path parameter
+// when present, else parsed from the raw path.
+function connectionPathId(event) {
+  if (event && event.pathParameters && event.pathParameters.id) {
+    return event.pathParameters.id;
+  }
+  const path =
+    (event && event.requestContext && event.requestContext.http && event.requestContext.http.path) ||
+    (event && event.rawPath) || '';
+  const m = path.match(/\/integrations\/google\/connections\/([^/]+)\/?$/i);
+  return m ? m[1] : null;
 }
 
 // 302 redirect response (the consent hop and the post-callback return-to-app).
@@ -306,6 +322,149 @@ async function disconnect(event) {
   return json(200, { disconnected: true, id }, event);
 }
 
+// GET /integrations/google/calendars — Bearer-authed. The connected account's
+// calendars for the caller's active connection, shaped for the picker UI only
+// ({ id, name, is_current, time_zone }) — never the vendor's raw payload.
+async function listAccountCalendars(event) {
+  const { user } = requireAuth(event);
+  const res = await db.query(
+    `select id, calendar_id from calendar_connections
+      where practice_id = $1 and user_id = $2 and status = 'active'
+      order by created_at
+      limit 1`,
+    [user.practice_id, user.sub]
+  );
+  const conn = res.rows[0];
+  if (!conn) {
+    return json(404, { error: 'No active calendar connection.' }, event);
+  }
+
+  let calendars;
+  try {
+    const refreshToken = await ssm.getParameter(refreshParamPath(conn.id));
+    const accessToken = await google.refreshAccessToken(refreshToken);
+    calendars = await google.listCalendars(accessToken);
+  } catch (err) {
+    console.error('calendar list: provider round-trip failed');
+    return json(502, {
+      error: 'Could not reach your calendar provider. Please try again.',
+    }, event);
+  }
+
+  return json(200, {
+    connection_id: conn.id,
+    calendars: calendars
+      .filter((c) => c.id)
+      .map((c) => ({
+        id: c.id,
+        name: c.summary || c.id,
+        is_current: c.id === conn.calendar_id,
+        time_zone: c.timeZone || null,
+      })),
+  }, event);
+}
+
+// PATCH /integrations/google/connections/{id} — Bearer-authed; body
+// { calendar_id }. Switches which of the account's calendars the connection
+// syncs. The chosen id must appear in the account's own calendar list (never
+// trust the client's string), and calendar_time_zone is taken from that
+// calendar's own timeZone — it is what keeps local session dates correct.
+// Staged calendar_events from the previous calendar are deleted UNLESS already
+// promoted to a session (those are an audit trail and are kept).
+async function setConnectionCalendar(event, connectionId) {
+  const { user } = requireAuth(event);
+  if (!connectionId || !UUID_RE.test(String(connectionId).trim())) {
+    return json(404, { error: 'Connection not found.' }, event);
+  }
+  const body = parseBody(event);
+  const calendarId = typeof body.calendar_id === 'string' ? body.calendar_id.trim() : '';
+  if (!calendarId) {
+    return json(400, { error: 'calendar_id is required.' }, event);
+  }
+
+  const connRes = await db.query(
+    `select id, calendar_id, status from calendar_connections
+      where id = $1 and practice_id = $2 and user_id = $3`,
+    [String(connectionId).trim(), user.practice_id, user.sub]
+  );
+  const conn = connRes.rows[0];
+  if (!conn) {
+    // Cross-practice / cross-user / unknown → 404, never 403.
+    return json(404, { error: 'Connection not found.' }, event);
+  }
+  if (conn.status !== 'active') {
+    return json(400, { error: 'This calendar connection is not active. Reconnect it first.' }, event);
+  }
+
+  // Already syncing the chosen calendar: report success without touching the
+  // staged rows — a no-op must never clear the review list.
+  if (conn.calendar_id === calendarId) {
+    return json(200, { updated: false, id: conn.id, calendar_id: conn.calendar_id }, event);
+  }
+
+  // The (user_id, calendar_id) unique key would make the UPDATE below throw if
+  // another of the user's connections already syncs the target — reject with a
+  // clear error instead of letting the constraint surface as a 500.
+  const dup = await db.query(
+    `select 1 from calendar_connections
+      where user_id = $1 and calendar_id = $2 and id <> $3
+      limit 1`,
+    [user.sub, calendarId, conn.id]
+  );
+  if (dup.rowCount > 0) {
+    return json(409, { error: 'Another of your connections already syncs that calendar.' }, event);
+  }
+
+  let chosen;
+  try {
+    const refreshToken = await ssm.getParameter(refreshParamPath(conn.id));
+    const accessToken = await google.refreshAccessToken(refreshToken);
+    const calendars = await google.listCalendars(accessToken);
+    chosen = calendars.find((c) => c.id === calendarId);
+  } catch (err) {
+    console.error('calendar switch: provider round-trip failed');
+    return json(502, {
+      error: 'Could not reach your calendar provider. Please try again.',
+    }, event);
+  }
+  if (!chosen) {
+    return json(400, { error: 'That calendar was not found on the connected account.' }, event);
+  }
+
+  // Switch + cleanup atomically: a failure must not leave the new calendar
+  // pointed at with the old calendar's staged rows still in the review list
+  // (or vice versa).
+  const cleared = await db.withTransaction(async (tx) => {
+    await tx.query(
+      `update calendar_connections
+          set calendar_id = $2, calendar_time_zone = $3, last_sync_error = null
+        where id = $1`,
+      [conn.id, chosen.id, chosen.timeZone || null]
+    );
+    const del = await tx.query(
+      `delete from calendar_events
+        where connection_id = $1 and session_id is null`,
+      [conn.id]
+    );
+    return del.rowCount;
+  });
+
+  await audit(event, { userId: user.sub, practiceId: user.practice_id }, {
+    action: 'calendar_connection.switch_calendar',
+    resourceType: 'calendar_connection',
+    resourceId: conn.id,
+    metadata: { events_cleared: cleared },
+  });
+
+  return json(200, {
+    updated: true,
+    id: conn.id,
+    calendar_id: chosen.id,
+    calendar_time_zone: chosen.timeZone || null,
+    events_cleared: cleared,
+  }, event);
+}
+
 // --- dispatch --------------------------------------------------------------------
 
 exports.handler = async (event) => {
@@ -317,7 +476,12 @@ exports.handler = async (event) => {
     if (method === 'GET' && act === 'start') return await start(event);
     if (method === 'GET' && act === 'callback') return await callback(event);
     if (method === 'GET' && act === 'status') return await status(event);
+    if (method === 'GET' && act === 'calendars') return await listAccountCalendars(event);
     if (method === 'POST' && act === 'disconnect') return await disconnect(event);
+    if (method === 'PATCH') {
+      const connId = connectionPathId(event);
+      if (connId) return await setConnectionCalendar(event, connId);
+    }
     return json(404, { error: 'Not found.' }, event);
   } catch (err) {
     if (err && err.name === 'AuthError') {

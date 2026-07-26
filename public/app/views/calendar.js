@@ -47,6 +47,9 @@
       Promise.all([
         api.calendarEvents.list(),
         api.clients.list(),
+        // No active connection (404) or a provider hiccup must not take the
+        // review list down — the picker just doesn't render.
+        api.calendarConnections.calendars().catch(function () { return null; }),
       ]).then(function (results) {
         var events = (results[0] && results[0].calendar_events) || [];
         // Pickable clients: not soft-deleted (the API already excludes those)
@@ -54,13 +57,13 @@
         var clients = ((results[1] && results[1].clients) || []).filter(function (c) {
           return c.status !== 'inactive';
         });
-        render(events, clients);
+        render(events, clients, results[2]);
       }).catch(function (err) {
         R.renderError(root, err, load);
       });
     }
 
-    function render(events, clients) {
+    function render(events, clients, calInfo) {
       R.clear(root);
 
       // Display labels for the picker; duplicate names are disambiguated with
@@ -240,6 +243,60 @@
         },
       }, 'Sync now');
 
+      // Which of the account's calendars this connection syncs. Switching
+      // clears staged (unconfirmed) appointments server-side, so it always
+      // warns first; confirmed rows are untouched.
+      var calendarPicker = null;
+      if (calInfo && calInfo.connection_id && (calInfo.calendars || []).length) {
+        var current = null;
+        var picker = h('select', {
+          class: 'field__control',
+          'aria-label': 'Calendar to sync',
+          style: 'max-width:16rem;font-size:var(--font-size-2)',
+        }, calInfo.calendars.map(function (cal) {
+          if (cal.is_current) current = cal;
+          var opt = h('option', { value: cal.id }, cal.name);
+          if (cal.is_current) opt.selected = true;
+          return opt;
+        }));
+        picker.addEventListener('change', function () {
+          var chosen = null;
+          calInfo.calendars.forEach(function (cal) {
+            if (cal.id === picker.value) chosen = cal;
+          });
+          if (!chosen || (current && chosen.id === current.id)) return;
+          var ok = window.confirm(
+            'Switch syncing to "' + chosen.name + '"?\n\n' +
+            'Staged appointments not yet confirmed will be cleared. ' +
+            'Confirmed sessions are kept.'
+          );
+          if (!ok) {
+            picker.value = current ? current.id : '';
+            return;
+          }
+          picker.disabled = true;
+          syncBtn.disabled = true;
+          api.calendarConnections.setCalendar(calInfo.connection_id, chosen.id)
+            .then(function () {
+              R.toast('Now syncing "' + chosen.name + '"', 'success');
+              // Pull the new calendar's appointments in right away, then
+              // reload the list either way — the switch itself succeeded.
+              return api.calendarEvents.sync().catch(function () {});
+            })
+            .then(load)
+            .catch(function (err) {
+              picker.disabled = false;
+              syncBtn.disabled = false;
+              picker.value = current ? current.id : '';
+              R.toast(err.message || 'Could not switch calendars.', 'error');
+            });
+        });
+        calendarPicker = h('label', {
+          style: 'display:inline-flex;align-items:center;gap:var(--space-2);' +
+            'color:var(--color-text-muted);font-size:var(--font-size-2)',
+        }, ['Syncing', picker]);
+      }
+
       var table = h('table', { class: 'data-table' }, [
         h('thead', null, h('tr', null, [
           h('th', null, 'Date'),
@@ -258,7 +315,7 @@
       root.appendChild(h('div', { class: 'view stack' }, [
         h('div', { class: 'page-header' }, [
           h('h1', { class: 'page-header__title' }, 'Calendar'),
-          h('div', { class: 'page-header__actions' }, [syncBtn]),
+          h('div', { class: 'page-header__actions' }, [calendarPicker, syncBtn]),
         ]),
         countEl,
         h('div', { class: 'card' }, table),
