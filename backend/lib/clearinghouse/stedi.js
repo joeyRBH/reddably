@@ -17,6 +17,8 @@
 // published shapes but should be confirmed against a Stedi test account before
 // going live. Until validated, keep CLEARINGHOUSE=mock.
 
+const { isValidPlaceOfService } = require('../place_of_service');
+
 const name = 'stedi';
 const BASE =
   process.env.STEDI_BASE_URL ||
@@ -443,13 +445,23 @@ function buildSubmissionBody(ctx) {
     );
   }
 
+  // Place of service (Box 24B/32) — the session decides. 11 = office,
+  // 10 = telehealth in the patient's home, 02 = telehealth elsewhere.
+  // An ABSENT value is a safe default (office); a WRONG value is a rejected
+  // claim ("CLM-05-01 cannot exceed 2 characters"), so an invalid code refuses
+  // to build rather than riding the 837P to the payer unchallenged.
+  const placeOfServiceCode = cleanStr(session.place_of_service);
+  if (placeOfServiceCode && !isValidPlaceOfService(placeOfServiceCode)) {
+    throw new Error(
+      'Session place_of_service is not a valid two-character CMS place-of-service ' +
+      'code. Fix it on the session before submitting.'
+    );
+  }
+
   const claimInformation = {
     claimFilingCode: 'CI',           // commercial / OON default
     claimFrequencyCode: '1',         // original claim
-    // Place of service (Box 24B/32) — the session decides. 11 = office,
-    // 10 = telehealth in the patient's home, 02 = telehealth elsewhere.
-    // Falls back to office when the session carries nothing.
-    placeOfServiceCode: cleanStr(session.place_of_service) || '11',
+    placeOfServiceCode: placeOfServiceCode || '11',
     claimChargeAmount: claim.billed_amount != null ? String(claim.billed_amount) : undefined,
     patientControlNumber: patientControlNumber(claim), // <=20 chars; echoed in 277CA / 835 ERA for reconciliation
     benefitsAssignmentCertificationIndicator: 'N',

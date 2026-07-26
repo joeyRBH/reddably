@@ -145,7 +145,20 @@
     { name: 'cpt_code',         label: 'CPT code',       type: 'text' },
     { name: 'duration_minutes', label: 'Duration (min)', type: 'number' },
     { name: 'fee',              label: 'Fee',            type: 'number' },
-    { name: 'place_of_service', label: 'Place of service', type: 'text' },
+    // CMS two-character codes only (837P 2300/CLM05-01) — free text here is what
+    // got a live claim rejected ("office" is six characters, the payer wants 11).
+    // The backend re-validates against the same list and is authoritative; the
+    // empty option means "not set" (the 837P builder defaults it to 11 — Office).
+    { name: 'place_of_service', label: 'Place of service', type: 'select',
+      options: [
+        { value: '',   label: 'Not set' },
+        { value: '02', label: '02 — Telehealth (patient not in their home)' },
+        { value: '10', label: '10 — Telehealth (patient in their home)' },
+        { value: '11', label: '11 — Office' },
+        { value: '12', label: '12 — Home' },
+        { value: '49', label: '49 — Independent clinic' },
+        { value: '53', label: '53 — Community mental health center' },
+      ] },
     { name: 'procedure_modifiers', label: 'Procedure modifiers', type: 'text',
       placeholder: '95, GT',
       hint: 'Optional payer-required modifiers, comma-separated. Example: 95 for ' +

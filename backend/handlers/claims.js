@@ -35,6 +35,7 @@ const {
   insertReplacementClaim,
   ensurePatientControlNumber,
 } = require('../lib/claims');
+const { PLACE_OF_SERVICE_CODES, isValidPlaceOfService } = require('../lib/place_of_service');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -349,6 +350,19 @@ function missingDependentPolicyholderField(insurance) {
   if (name == null || String(name).trim() === '') return true;
   if (dob == null || String(dob).trim() === '') return true;
   return false;
+}
+
+// The session's place_of_service, when present, must be a valid two-character
+// CMS code (lib/place_of_service.js) — the payer rejects anything else at the
+// front door (837P 2300/CLM-05-01). Empty is fine: the adapter defaults it to 11
+// (office). Returns the offending trimmed value, or null when submittable.
+// Handler validation (handlers/sessions.js) makes new bad values unsaveable;
+// this catches rows written before that validation existed.
+function invalidSessionPlaceOfService(session) {
+  if (!session || session.place_of_service == null) return null;
+  const pos = String(session.place_of_service).trim();
+  if (pos === '' || isValidPlaceOfService(pos)) return null;
+  return pos;
 }
 
 // --- pre-submission sanity warnings (soft; NEVER hard-block) -----------------
@@ -753,6 +767,18 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   if (missingDependentPolicyholderField(ctx.insurance)) {
     return json(422, {
       error: 'Policyholder name and date of birth are required on the insurance record before submitting a dependent claim. Edit the client\'s insurance to add them.',
+    }, event);
+  }
+
+  // Place of service must be a valid two-character CMS code before the claim can
+  // go out — a free-text value ("office") is rejected by the payer at the front
+  // door (837P 2300/CLM-05-01). HARD block, not a soft warning: no confirmation
+  // makes an invalid code transmittable. An EMPTY value stays submittable — the
+  // adapter defaults it to 11 (office).
+  const sessionPlaceOfService = invalidSessionPlaceOfService(ctx.session);
+  if (sessionPlaceOfService != null) {
+    return json(422, {
+      error: `Session place of service is not a valid CMS code. Edit the session and pick one of: ${PLACE_OF_SERVICE_CODES.map((e) => `${e.code} (${e.label})`).join(', ')}.`,
     }, event);
   }
 
@@ -1244,6 +1270,7 @@ async function listEvents(practiceId, id, event) {
 exports.missingBillingAddressField = missingBillingAddressField;
 exports.missingSubscriberField = missingSubscriberField;
 exports.missingDependentPolicyholderField = missingDependentPolicyholderField;
+exports.invalidSessionPlaceOfService = invalidSessionPlaceOfService;
 exports.evaluateSubmissionWarnings = evaluateSubmissionWarnings;
 exports.ageInYears = ageInYears;
 exports.REGENERATABLE_STATUSES = REGENERATABLE_STATUSES;
