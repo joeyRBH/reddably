@@ -408,6 +408,19 @@
     sync: function () { return request('POST', '/integrations/google/sync', {}); },
   };
 
+  // Inbound calendar connection — which of the account's calendars is synced.
+  //   calendars()               -> { connection_id, calendars: [{ id, name,
+  //                                is_current, time_zone }] } for the caller's
+  //                                active connection (404 when none)
+  //   setCalendar(id, calId)    -> { updated, id, calendar_id, ... }  switches the
+  //                                connection; unconfirmed staged events are cleared
+  var calendarConnections = {
+    calendars: function () { return request('GET', '/integrations/google/calendars'); },
+    setCalendar: function (id, calendarId) {
+      return request('PATCH', '/integrations/google/connections/' + id, { calendar_id: calendarId });
+    },
+  };
+
   // Subscription / plan (Instant VOB add-on).
   //   status()      -> { plan, vob_checks_used, vob_period_start }  (Lambda API; DB-only)
   //   activateVob() -> { checkoutUrl }  (Vercel function; Stripe egress) — redirect there
@@ -517,6 +530,7 @@
     invitations: invitations,
     calendar: calendar,
     calendarEvents: calendarEvents,
+    calendarConnections: calendarConnections,
     billing: billing,
     subscription: subscription,
     vob: vob,
