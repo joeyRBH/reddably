@@ -8,6 +8,13 @@
 //   async getStatus({ control_number, claim })
 //                             -> { status, denial_reason?, allowed_amount?,
 //                                  reimbursed_amount?, patient_responsibility?, raw }
+//   async reconcileSubmission({ ctx, patientControlNumber })   (optional)
+//                             -> { found: true, status, control_number?, raw }
+//                                | { found: false, raw }
+//     Look up a submission whose outcome was never confirmed, matching on the
+//     patient control number that was transmitted. Adapters that can't do this
+//     (claim_md) simply don't export it; the handler then requires an explicit
+//     operator resolution instead.
 //
 // `ctx` is a normalized object the handler assembles (claim/session/client/
 // insurance/clinician/practice) so adapters never touch the DB.

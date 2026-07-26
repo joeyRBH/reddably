@@ -67,6 +67,14 @@ locals {
     }
     claims = {
       handler = "handlers/claims.handler"
+      # 60s timeout: submit/refresh/reconcile round-trip the clearinghouse, whose
+      # adapter bounds each call at 15s (STEDI_TIMEOUT_MS). The old 15s default
+      # killed the Lambda BEFORE that bound could fire — the submit outcome (and
+      # any error log) was lost while the clearinghouse had already accepted the
+      # claim. Same API-GW 29s response-cap note as calendar_sync: a slow call
+      # still finishes (and records its outcome) server-side even if the client
+      # sees a gateway timeout.
+      timeout = 60
       routes = [
         { method = "POST", path = "claims" },
         { method = "GET", path = "claims" },
@@ -75,6 +83,7 @@ locals {
         { method = "DELETE", path = "claims/{id}" },
         { method = "POST", path = "claims/{id}/submit" },
         { method = "POST", path = "claims/{id}/refresh" },
+        { method = "POST", path = "claims/{id}/reconcile" },
         { method = "POST", path = "claims/{id}/void" },
         { method = "POST", path = "claims/{id}/regenerate" },
         { method = "GET", path = "claims/{id}/events" },

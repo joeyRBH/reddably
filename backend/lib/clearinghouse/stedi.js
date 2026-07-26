@@ -1070,6 +1070,99 @@ async function getStatus({ control_number, claim, ctx }) {
 }
 
 // -----------------------------------------------------------------------------
+// Reconciliation — resolve a submission whose outcome was never confirmed (the
+// Lambda died / the connection dropped mid-submit). Reuses the claim-status
+// (276/277) transport, but matches STRICTLY on the CLM01 patient control number
+// we transmitted: the 276 base request matches on subscriber + provider + DOS,
+// so the response can legitimately carry OTHER claims for the same patient and
+// week. Adopting one of those would mislabel the pending claim — only an entry
+// that echoes OUR control number counts; anything else is "no match", which the
+// handler treats as inconclusive (never as "safe to resubmit").
+// -----------------------------------------------------------------------------
+
+// The fields a 277 entry may echo the CLM01 patient control number on, checked
+// on both the entry and its claimStatus child. Field names should be confirmed
+// against a Stedi test account (see the file-header disclaimer); an unmatched
+// echo merely yields "no match", which is the safe direction.
+function echoedPatientControlNumber(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const s = (entry.claimStatus && typeof entry.claimStatus === 'object' && entry.claimStatus) ||
+    (entry.status && typeof entry.status === 'object' && entry.status) || {};
+  const candidates = [
+    entry.patientControlNumber, entry.patientAccountNumber, entry.clm01,
+    s.patientControlNumber, s.patientAccountNumber, s.clm01,
+  ];
+  for (const c of candidates) {
+    if (c != null && String(c).trim() !== '') return String(c).trim();
+  }
+  return null;
+}
+
+// Pure: scan a claim-status response for the entry echoing the given patient
+// control number (newest entry wins, mirroring firstStatus). Both sides are
+// normalized through boundControlNumber so formatting differences can't miss.
+function findStatusByPatientControlNumber(data, pcn) {
+  const target = boundControlNumber(pcn);
+  if (!data || typeof data !== 'object' || !target) return null;
+  const claims = Array.isArray(data.claims) ? data.claims : (data.claim ? [data.claim] : []);
+  for (let i = claims.length - 1; i >= 0; i -= 1) {
+    const echoed = echoedPatientControlNumber(claims[i]);
+    if (echoed && boundControlNumber(echoed) === target) {
+      const entry = claims[i];
+      return entry.claimStatus || entry.status || entry;
+    }
+  }
+  return null;
+}
+
+// reconcileSubmission({ ctx, patientControlNumber }) ->
+//   { found: true, status, control_number: null, raw } | { found: false, raw }.
+//
+// found:true means the clearinghouse HAS the claim — the caller adopts `status`
+// and must not allow a resubmission. A recognized entry whose lifecycle bucket
+// we can't map still returns 'submitted' (received/acknowledged is exactly what
+// the caller needs to know to block a duplicate; a later refresh refines it).
+// control_number is always null here: the 276/277 never returns the submission
+// correlationId our submit path stores, and fabricating one would poison later
+// acknowledgment matching.
+async function reconcileSubmission({ ctx, patientControlNumber: pcn }) {
+  const { body } = buildStatusBody(ctx);
+
+  const res = await stediPost('/claimstatus/v2', body);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    // Structural hints only (error code / field names) — never values or message
+    // text, which can carry PHI. Same policy as getStatus.
+    if (res.status >= 400 && res.status < 500) {
+      const hints = statusErrorHints(data);
+      if (hints.length) {
+        console.error(`Stedi reconciliation lookup ${res.status} fields: ${hints.join('; ')}`);
+      }
+    }
+    throw new Error(`Stedi reconciliation lookup failed (HTTP ${res.status})`);
+  }
+
+  const info = findStatusByPatientControlNumber(data, pcn);
+  if (!info) return { found: false, raw: data };
+
+  const category =
+    info.claimStatusCategoryCode != null ? info.claimStatusCategoryCode
+      : info.statusCategoryCode != null ? info.statusCategoryCode
+        : null;
+  const statusCode =
+    info.statusCode != null ? info.statusCode
+      : info.claimStatusCode != null ? info.claimStatusCode
+        : info.code != null ? info.code
+          : null;
+
+  let status = mapStatusCategory(category);
+  if (status == null && statusCode != null) status = mapStatus(statusCode);
+  if (status == null) status = 'submitted';
+
+  return { found: true, status, control_number: null, raw: data };
+}
+
+// -----------------------------------------------------------------------------
 // Eligibility / VOB (270/271) — real-time benefit check. Powers the Instant VOB
 // add-on (handlers/vob.js). Same base + raw-key auth as submitClaim; the endpoint
 // is {base}/eligibility/v3. Returns Stedi's parsed 271 response verbatim; the
@@ -1326,6 +1419,7 @@ module.exports = {
   name,
   submitClaim,
   getStatus,
+  reconcileSubmission,
   checkEligibility,
   searchPayers,
   mapStatus,
@@ -1343,6 +1437,7 @@ module.exports = {
   parseSubmissionRejection,
   patientControlNumber,
   boundControlNumber,
+  findStatusByPatientControlNumber,
   resolveUsageIndicator,
   testSubmissionsAllowed,
   isReplacementClaim,
