@@ -52,7 +52,9 @@ resource "aws_lambda_function" "auth" {
   source_code_hash = data.archive_file.backend.output_base64sha256
 
   memory_size   = var.lambda_memory_mb
-  timeout       = var.lambda_timeout_seconds
+  # A function may override the default timeout in local.lambda_functions
+  # (e.g. calendar_sync, which round-trips an external API).
+  timeout       = try(each.value.timeout, var.lambda_timeout_seconds)
   architectures = ["arm64"]
 
   vpc_config {

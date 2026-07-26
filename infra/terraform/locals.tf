@@ -160,6 +160,19 @@ locals {
         { method = "POST", path = "integrations/google/disconnect" },
       ]
     }
+    calendar_sync = {
+      handler = "handlers/calendar_sync.handler"
+      # INBOUND Google Calendar sync — on-demand event ingestion into
+      # calendar_events (no matching, no promotion, no schedule). Syncs every
+      # active connection owned by the caller. 60s timeout: it round-trips an
+      # external calendar API per connection. NOTE: API Gateway still caps the
+      # HTTP response at 29s — a longer sync finishes server-side even if the
+      # client sees a gateway timeout.
+      timeout = 60
+      routes = [
+        { method = "POST", path = "integrations/google/sync" },
+      ]
+    }
     vob = {
       handler = "handlers/vob.handler"
       routes = [
