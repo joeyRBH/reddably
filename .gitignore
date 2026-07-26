@@ -28,3 +28,4 @@ Thumbs.db
 
 # Terraform local backups
 infra/terraform/terraform.tfvars.bak
+.claude/settings.local.json
