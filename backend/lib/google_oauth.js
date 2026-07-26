@@ -27,6 +27,9 @@ const TOKEN_URL =
 const CALENDAR_LIST_URL =
   process.env.GOOGLE_CALENDAR_LIST_URL ||
   'https://www.googleapis.com/calendar/v3/users/me/calendarList';
+const CALENDAR_EVENTS_URL_BASE =
+  process.env.GOOGLE_CALENDAR_EVENTS_URL_BASE ||
+  'https://www.googleapis.com/calendar/v3/calendars';
 
 // Read-only calendar access — the narrowest scope that lets the sync read
 // events. Never widen without a design review (HIPAA minimum-necessary).
@@ -148,8 +151,16 @@ async function refreshAccessToken(refreshToken) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.access_token) {
     // A 400 invalid_grant here means the clinician revoked access — the caller
-    // marks the connection needs_reauth. Status only; never the body.
-    throw new Error(`Google token refresh failed (HTTP ${res.status})`);
+    // marks the connection needs_reauth. Status only in the message; never the
+    // body. The HTTP status and the bare OAuth error CODE (e.g. invalid_grant —
+    // a fixed vocabulary, not a credential) ride as properties so the sync
+    // layer can classify without string-matching the message.
+    const err = new Error(`Google token refresh failed (HTTP ${res.status})`);
+    err.status = res.status;
+    if (typeof data.error === 'string' && /^[a-z_]+$/.test(data.error)) {
+      err.oauthErrorCode = data.error;
+    }
+    throw err;
   }
   return data.access_token;
 }
@@ -180,11 +191,62 @@ async function listCalendars(accessToken) {
   }));
 }
 
+// listEvents(accessToken, calendarId, { timeMin, timeMax, pageToken }) -> the
+// flat array of event resources in the window, following nextPageToken until
+// exhausted (pageToken, when given, is the page to start from).
+//
+// Always sent, non-negotiable for the inbound sync:
+//   * singleEvents=true — a weekly recurring appointment must expand into one
+//     item per occurrence, since each occurrence is a separate billable session;
+//   * showDeleted=true — cancellations arrive as status:'cancelled' tombstones
+//     instead of silently vanishing from the window.
+//
+// Items are returned VERBATIM. Event titles (summary) are PHI — callers must
+// never log them, and nothing here touches or echoes item contents.
+async function listEvents(accessToken, calendarId, { timeMin, timeMax, pageToken } = {}) {
+  const base = `${CALENDAR_EVENTS_URL_BASE}/${encodeURIComponent(calendarId)}/events`;
+  const items = [];
+  let nextPage = pageToken || null;
+
+  do {
+    const qs = new URLSearchParams({
+      singleEvents: 'true',
+      showDeleted: 'true',
+      maxResults: '2500',
+    });
+    if (timeMin) qs.set('timeMin', timeMin);
+    if (timeMax) qs.set('timeMax', timeMax);
+    if (nextPage) qs.set('pageToken', nextPage);
+
+    const res = await googleFetch('events list', `${base}?${qs.toString()}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+      },
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      // Status only — an events body carries PHI (titles). A 401 here means the
+      // access token was revoked mid-flight; the caller marks needs_reauth.
+      const err = new Error(`Google events list failed (HTTP ${res.status})`);
+      err.status = res.status;
+      throw err;
+    }
+    if (Array.isArray(data.items)) items.push(...data.items);
+    nextPage = data.nextPageToken || null;
+  } while (nextPage);
+
+  return items;
+}
+
 module.exports = {
   buildAuthUrl,
   exchangeCode,
   refreshAccessToken,
   listCalendars,
+  listEvents,
   SCOPE,
   REDIRECT_URI,
 };
