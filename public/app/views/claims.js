@@ -15,12 +15,31 @@
   var h = R.h;
   var api = R.api;
 
-  // The full claim lifecycle, in order. Drives the list filter and the
-  // status -> action matrix on the detail screen.
+  // The full claim lifecycle, in order. Drives the status -> action matrix on
+  // the detail screen.
   var CLAIM_STATUSES = [
     'draft', 'submitted', 'processing', 'info_requested',
     'denied', 'appealed', 'paid', 'void',
   ];
+
+  // The workspace splits on exactly this: a draft is verification work, and
+  // everything else is history. The submitted-section filter offers only the
+  // non-draft statuses, so filtering history can never hide the draft queue.
+  var HISTORY_STATUSES = CLAIM_STATUSES.filter(function (s) { return s !== 'draft'; });
+
+  // Server-projected readiness (GET /claims, draft rows only — see
+  // backend/lib/claim_readiness.js). Informational: a badge reports what the
+  // submit gate would say right now, it does not approve or submit anything.
+  // Submission stays where it has always been — explicit, on the claim detail.
+  //
+  // Tones follow the design system: 'needs-review' workflow states stay stone,
+  // and a draft is in-flight work, so ready_to_review is never sage. Only the
+  // blocked state earns the warning tone (attention required, not failure).
+  var READINESS = {
+    needs_correction: { label: 'Needs correction', tone: 'warning' },
+    review_warning:   { label: 'Review warning',   tone: 'neutral' },
+    ready_to_review:  { label: 'Ready to review',  tone: 'neutral' },
+  };
 
   // ---------------------------------------------------------------------------
   // Small shared helpers
@@ -89,18 +108,87 @@
     }, text);
   }
 
+  // A claim's diagnosis codes as one readable cell, in the order the session
+  // stores them (that order is clinically meaningful — primary dx first). Long
+  // lists are truncated with a count rather than wrapping the row.
+  function diagnosisLabel(codes) {
+    if (!Array.isArray(codes) || !codes.length) return '—';
+    if (codes.length <= 3) return codes.join(', ');
+    return codes.slice(0, 3).join(', ') + ' +' + (codes.length - 3);
+  }
+
+  // The readiness verdict as a calm badge plus, when there is something to act
+  // on, the first message underneath. Informational only — nothing here submits.
+  function readinessCell(readiness) {
+    var key = readiness && readiness.state;
+    var spec = READINESS[key];
+    if (!spec) return h('span', { class: 'badge badge--neutral' }, '—');
+
+    var detail = (readiness.blockers && readiness.blockers[0]) ||
+      (readiness.warnings && readiness.warnings[0]) || null;
+    var all = (readiness.blockers || []).concat(readiness.warnings || [])
+      .map(function (item) { return item && item.message; }).filter(Boolean);
+
+    return h('div', {
+      style: 'display:flex;flex-direction:column;gap:var(--space-1);align-items:flex-start',
+      title: all.join('\n'),
+    }, [
+      h('span', { class: 'badge badge--' + spec.tone }, spec.label),
+      detail && detail.message
+        ? h('span', {
+            style: 'font-size:var(--font-size-2);color:var(--color-text-muted)',
+          }, detail.message)
+        : null,
+    ]);
+  }
+
+  // Descending comparator over a list of string keys, first non-equal wins.
+  // Missing values sort last, so a claim with no submitted_at never displaces a
+  // submitted one. Dates arrive as ISO-prefixed strings, which compare correctly
+  // as text — no Date parsing, no timezone guessing.
+  function byDesc(keys) {
+    return function (a, b) {
+      for (var i = 0; i < keys.length; i += 1) {
+        var av = a[keys[i]] == null ? '' : String(a[keys[i]]);
+        var bv = b[keys[i]] == null ? '' : String(b[keys[i]]);
+        if (av !== bv) return av < bv ? 1 : -1;
+      }
+      return 0;
+    };
+  }
+
+  // Drafts are verification work: newest date of service first, creation time as
+  // the stable tie-breaker so same-day drafts never shuffle between renders.
+  var byServiceDate = byDesc(['session_date', 'created_at']);
+  // History is a record of what was sent: most recently submitted first, falling
+  // back to creation time so a terminal claim that was never submitted (void)
+  // still lands deterministically.
+  var bySubmittedAt = byDesc(['submitted_at', 'created_at']);
+
   // ===========================================================================
-  // Screen 1 — Claims list (#claims)
+  // Screen 1 — Claims workspace (#claims): verify drafts on top, history below
   // ===========================================================================
   function renderClaimList(root) {
-    // Server-side status filter: re-query on change, never filter client-side.
-    function load(status) {
+    // The draft queue is ALWAYS loaded unfiltered — the status filter belongs to
+    // the submitted section alone, and no filter choice may hide verification
+    // work. With no filter one request covers both sections (partitioning a
+    // result set is not client-side filtering); choosing a history status adds a
+    // second, server-filtered request rather than narrowing the drafts.
+    function load(historyStatus) {
       R.renderLoading(root);
-      var filters = status ? { status: status } : undefined;
-      api.claims.list(filters).then(function (res) {
-        render((res && res.claims) || [], status || '');
+      var pending = historyStatus
+        ? Promise.all([api.claims.list({ status: 'draft' }), api.claims.list({ status: historyStatus })])
+        : api.claims.list().then(function (res) { return [res, null]; });
+
+      pending.then(function (results) {
+        var first = (results[0] && results[0].claims) || [];
+        var drafts = first.filter(function (c) { return c.status === 'draft'; });
+        var history = results[1]
+          ? ((results[1].claims) || [])
+          : first.filter(function (c) { return c.status !== 'draft'; });
+        render(drafts, history, historyStatus || '');
       }).catch(function (err) {
-        R.renderError(root, err, function () { load(status); });
+        R.renderError(root, err, function () { load(historyStatus); });
       });
     }
 
@@ -176,84 +264,152 @@
       });
     }
 
-    function render(claims, status) {
-      R.clear(root);
+    // Every row opens the claim detail — that is where editing and submitting
+    // live, and they stay there. The list never acts on a claim.
+    function claimRow(cells, id) {
+      var row = h('tr', {
+        class: 'data-table__row--clickable',
+        tabindex: '0',
+        role: 'link',
+      }, cells);
+      function go() { R.navigate('claims/' + id); }
+      row.addEventListener('click', go);
+      row.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+      });
+      return row;
+    }
 
-      // Genuinely-empty (unfiltered) state gets the full empty placeholder.
-      if (!claims.length && !status) {
-        R.renderEmpty(root, {
-          title: 'No claims yet',
-          body: 'Create a claim from a session.',
-          actionLabel: 'New claim',
-          onAction: openCreate,
+    function clientCell(c) {
+      return c.client_name || ('#' + String(c.client_id || '').slice(0, 8));
+    }
+
+    function payerCell(c) {
+      return c.payer_name || c.payer_id || '—';
+    }
+
+    // Section 1 — the verification queue. Everything a human checks before a
+    // claim goes out is on the row: who, when, what was done, what it cost, who
+    // pays, and what the server's readiness projection currently says.
+    function draftsCard(drafts) {
+      var body;
+      if (!drafts.length) {
+        body = inlineEmpty('No claims waiting for verification.');
+      } else {
+        var rows = drafts.slice().sort(byServiceDate).map(function (c) {
+          return claimRow([
+            h('td', null, clientCell(c)),
+            h('td', null, R.fmtDate(c.session_date)),
+            h('td', null, c.cpt_code || '—'),
+            h('td', null, diagnosisLabel(c.diagnosis_codes)),
+            h('td', { class: 'data-table__num' }, R.fmtMoney(c.billed_amount)),
+            h('td', null, payerCell(c)),
+            h('td', null, readinessCell(c.readiness)),
+          ], c.id);
         });
-        return;
+        body = h('table', { class: 'data-table' }, [
+          h('thead', null, h('tr', null, [
+            h('th', null, 'Client'),
+            h('th', null, 'Date of service'),
+            h('th', null, 'CPT'),
+            h('th', null, 'Diagnosis'),
+            h('th', { class: 'data-table__num' }, 'Billed'),
+            h('th', null, 'Payer'),
+            h('th', null, 'Validation'),
+          ])),
+          h('tbody', null, rows),
+        ]);
       }
 
+      return h('div', { class: 'card' }, [
+        h('div', { class: 'card__header' }, [
+          h('h2', { class: 'card__title' }, 'Ready to verify and submit'),
+        ]),
+        body,
+      ]);
+    }
+
+    // Section 2 — history. The status filter lives HERE and nowhere else, so it
+    // can only ever narrow what has already been sent.
+    function submittedCard(history, status) {
       var filterSelect = h('select', {
         class: 'field__control',
-        'aria-label': 'Filter by status',
+        'aria-label': 'Filter submitted claims by status',
         style: 'max-width:16rem',
         onChange: function (e) { load(e.target.value); },
       }, [{ value: '', label: 'All statuses' }].concat(
-        CLAIM_STATUSES.map(function (s) { return { value: s, label: humanize(s) }; })
+        HISTORY_STATUSES.map(function (s) { return { value: s, label: humanize(s) }; })
       ).map(function (o) {
         var attrs = { value: o.value };
         if (o.value === status) attrs.selected = 'selected';
         return h('option', attrs, o.label);
       }));
 
-      var cardContent;
-      if (!claims.length) {
-        cardContent = inlineEmpty('No claims match this filter.');
+      var body;
+      if (!history.length) {
+        body = inlineEmpty(status ? 'No submitted claims match this filter.' : 'No submitted claims yet.');
       } else {
-        // One row per claim: client · date of service · billed · status · payer.
-        // The display fields (client_name, session_date, payer_*) come from the
-        // list payload so there is no per-row fetch. Rows link to the detail view.
-        var rows = claims.map(function (c) {
-          var payer = c.payer_name || c.payer_id || '—';
-          var client = c.client_name || ('#' + String(c.client_id || '').slice(0, 8));
-          var row = h('tr', {
-            class: 'data-table__row--clickable',
-            tabindex: '0',
-            role: 'link',
-          }, [
-            h('td', null, client),
+        var rows = history.slice().sort(bySubmittedAt).map(function (c) {
+          return claimRow([
+            h('td', null, clientCell(c)),
             h('td', null, R.fmtDate(c.session_date)),
             h('td', { class: 'data-table__num' }, R.fmtMoney(c.billed_amount)),
             h('td', null, R.statusBadge(c.status)),
-            h('td', null, payer),
-          ]);
-          function go() { R.navigate('claims/' + c.id); }
-          row.addEventListener('click', go);
-          row.addEventListener('keydown', function (e) {
-            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
-          });
-          return row;
+            h('td', null, payerCell(c)),
+            h('td', null, c.submitted_at ? R.fmtDate(c.submitted_at) : '—'),
+          ], c.id);
         });
-
-        cardContent = h('table', { class: 'data-table' }, [
+        body = h('table', { class: 'data-table' }, [
           h('thead', null, h('tr', null, [
             h('th', null, 'Client'),
             h('th', null, 'Date of service'),
             h('th', { class: 'data-table__num' }, 'Billed'),
             h('th', null, 'Status'),
             h('th', null, 'Payer'),
+            h('th', null, 'Submitted'),
           ])),
           h('tbody', null, rows),
         ]);
+      }
+
+      return h('div', { class: 'card' }, [
+        h('div', { class: 'card__header' }, [
+          h('h2', { class: 'card__title' }, 'Submitted claims'),
+          filterSelect,
+        ]),
+        body,
+      ]);
+    }
+
+    function render(drafts, history, status) {
+      R.clear(root);
+
+      // Nothing at all, and nothing filtered away: the one case that still gets
+      // the full-page placeholder. Once either section has rows, each keeps its
+      // own empty state so a quiet queue never blanks the other section.
+      if (!drafts.length && !history.length && !status) {
+        R.renderEmpty(root, {
+          title: 'No claims yet',
+          body: 'Claims appear here as drafts once a session is confirmed.',
+          actionLabel: 'New claim',
+          onAction: openCreate,
+        });
+        return;
       }
 
       var view = h('div', { class: 'view stack' }, [
         h('div', { class: 'page-header' }, [
           h('h1', { class: 'page-header__title' }, 'Claims'),
           h('div', { class: 'page-header__actions' }, [
-            h('button', { class: 'btn btn--primary', type: 'button', onClick: openCreate },
+            // Secondary by design: claims normally arrive as drafts from
+            // confirmed sessions. Manual creation stays available for the
+            // exceptional case, without competing with the queue below.
+            h('button', { class: 'btn btn--ghost', type: 'button', onClick: openCreate },
               'New claim'),
           ]),
         ]),
-        filterSelect,
-        h('div', { class: 'card' }, cardContent),
+        draftsCard(drafts),
+        submittedCard(history, status),
       ]);
 
       root.appendChild(view);

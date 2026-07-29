@@ -36,7 +36,24 @@ const {
   insertReplacementClaim,
   ensurePatientControlNumber,
 } = require('../lib/claims');
-const { PLACE_OF_SERVICE_CODES, isValidPlaceOfService } = require('../lib/place_of_service');
+// Every PURE pre-submission rule lives in lib/claim_readiness.js — one
+// implementation shared by this submit path and the readiness projection on
+// GET /claims, so the list can never disagree with the gate. See that module's
+// header for why the projection composes these rather than copying them.
+const {
+  missingInsuranceRecord,
+  missingBillingAddressField,
+  missingSubscriberField,
+  missingDependentPolicyholderField,
+  invalidSessionPlaceOfService,
+  BLOCKER_MESSAGES,
+  placeOfServiceBlockerMessage,
+  ageInYears,
+  evaluateSubmissionWarnings,
+  REPLACEMENT_WARNING,
+  isReplacementClaim,
+  evaluateClaimReadiness,
+} = require('../lib/claim_readiness');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -78,14 +95,6 @@ function clearinghouseFailureClass(err) {
   if (m) return `http_${m[1]}`;
   if (/fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|socket|network/i.test(msg)) return 'network';
   return 'error';
-}
-
-// A claim carries replacement (frequency 7) intent when the durable frequency code
-// says so, or when it references the claim it replaces. Either alone is enough to
-// route it through the safety gate (both are set together by the /replace flow, but
-// checking both means a half-populated row can never slip out as a new original).
-function isReplacementClaim(claim) {
-  return claim.submission_frequency_code === '7' || claim.corrects_claim_id != null;
 }
 
 // claim_events.event_type enum (distinct from claim status). Used when logging.
@@ -194,6 +203,19 @@ function shapeClaim(r) {
 // N+1 fetch per claim. These are display-only; the base claim fields are
 // unchanged. clients.first/last/preferred and sessions.session_date come from
 // the joins in listClaims; payer prefers the insurance carrier name.
+//
+// ADDITIVE: the row also carries the session's billable facts (CPT, diagnosis,
+// place of service) so staff can verify a draft claim from the list without
+// opening it, plus `readiness` — the shared evaluator's projection (see
+// lib/claim_readiness.js). readiness is computed for DRAFT claims only and is
+// explicitly `null` on every other status, so the row shape is stable: a
+// non-draft claim has already been sent, and a "what would submit say" answer
+// about it would be meaningless.
+//
+// The validation INPUTS (practice address, client DOB, subscriber DOB/name,
+// member id) are read by the evaluator and deliberately NOT copied onto the row.
+// The list is a work queue, not a chart — it returns the verdict, never the PHI
+// the verdict was derived from.
 function shapeClaimRow(r) {
   const base = shapeClaim(r);
   if (!base) return null;
@@ -205,7 +227,49 @@ function shapeClaimRow(r) {
   base.session_date = r.session_date || null;
   base.payer_name = r.payer_name || null;
   base.payer_id = r.payer_id || null;
+  base.cpt_code = r.session_cpt_code || null;
+  base.diagnosis_codes = Array.isArray(r.session_diagnosis_codes) ? r.session_diagnosis_codes : null;
+  base.place_of_service = r.session_place_of_service || null;
+  base.readiness = base.status === 'draft' ? evaluateClaimReadiness(readinessContext(r)) : null;
   return base;
+}
+
+// Rebuild the normalized evaluator context from one joined list row. The shapes
+// must match what submit passes (buildClaimContext + loadClaim/loadInsuranceRecord),
+// or the projection would answer a different question than the gate:
+//
+//   * insurance is the LEFT-joined record, nulled when the row is hidden —
+//     loadInsuranceRecord filters is_hidden, so submit sees null there too;
+//   * session and client come from the inner joins (neither is is_hidden-filtered
+//     in buildClaimContext either);
+//   * practice comes from the practices join, the same row buildClaimContext loads.
+//
+// Nothing here leaves the server: the returned object feeds the evaluator and is
+// then discarded. Only { state, blockers, warnings } reaches the browser.
+function readinessContext(r) {
+  return {
+    claim: r,
+    session: {
+      place_of_service: r.session_place_of_service,
+    },
+    client: {
+      date_of_birth: r.client_date_of_birth,
+    },
+    practice: {
+      address_line1: r.practice_address_line1,
+      city: r.practice_city,
+      state: r.practice_state,
+      postal_code: r.practice_postal_code,
+    },
+    insurance: r.insurance_record_id != null && r.ins_is_hidden === false
+      ? {
+          subscriber_relationship: r.ins_subscriber_relationship,
+          subscriber_name: r.ins_subscriber_name,
+          subscriber_dob: r.ins_subscriber_dob,
+          member_id: r.ins_member_id,
+        }
+      : null,
+  };
 }
 
 // Claim-detail shaper — extends shapeClaim with a read-only `patient` block (the
@@ -325,165 +389,6 @@ async function loadClaimDetail(practiceId, id) {
     [id, practiceId]
   );
   return res.rows[0] || null;
-}
-
-// A practice needs a complete billing address before a claim can be submitted:
-// Stedi's 837P Billing.address requires address1 / city / state / postalCode
-// (address2 is optional). Missing any of these makes Stedi reject with a 400
-// ("Billing.address: missing field `address1`"); we catch it first and return a
-// clear 422 so staff know to fill in Practice Settings. Returns the first missing
-// field name, or null when the address is complete.
-function missingBillingAddressField(practice) {
-  if (!practice) return 'address1';
-  const required = [
-    ['address_line1', 'address1'],
-    ['city', 'city'],
-    ['state', 'state'],
-    ['postal_code', 'zip'],
-  ];
-  for (const [col, label] of required) {
-    const v = practice[col];
-    if (v == null || String(v).trim() === '') return label;
-  }
-  return null;
-}
-
-// The subscriber (patient) needs a date of birth before a claim can be built:
-// the 837P subscriber loop requires it, and without it Stedi rejects the claim.
-// DOB is collected from the client themselves in the SMS intake, so a
-// staff-created client may have none yet — we catch that here and return a clear
-// 422 (fill in DOB on the client chart) instead of letting the submission reach
-// the clearinghouse and 500/502. Returns the missing field name, or null.
-function missingSubscriberField(client) {
-  if (!client) return 'date_of_birth';
-  const dob = client.date_of_birth;
-  if (dob == null || String(dob).trim() === '') return 'date_of_birth';
-  return null;
-}
-
-// When the patient is a dependent on someone else's policy (the insurance record
-// names a subscriber_relationship other than 'self'), the 837P puts the
-// POLICYHOLDER in the subscriber loop and requires their name + date of birth.
-// Those come from the insurance record (subscriber_name / subscriber_dob), which
-// may be blank on a staff-created record — catch it here as a clean 422 rather
-// than letting Stedi reject with an opaque error. Returns true when the record is
-// a dependent record missing the policyholder name or DOB.
-function missingDependentPolicyholderField(insurance) {
-  if (!insurance) return false;
-  const rel = insurance.subscriber_relationship;
-  const isDependent =
-    rel != null && String(rel).trim() !== '' && String(rel).trim().toLowerCase() !== 'self';
-  if (!isDependent) return false;
-  const name = insurance.subscriber_name;
-  const dob = insurance.subscriber_dob;
-  if (name == null || String(name).trim() === '') return true;
-  if (dob == null || String(dob).trim() === '') return true;
-  return false;
-}
-
-// The session's place_of_service, when present, must be a valid two-character
-// CMS code (lib/place_of_service.js) — the payer rejects anything else at the
-// front door (837P 2300/CLM-05-01). Empty is fine: the adapter defaults it to 11
-// (office). Returns the offending trimmed value, or null when submittable.
-// Handler validation (handlers/sessions.js) makes new bad values unsaveable;
-// this catches rows written before that validation existed.
-function invalidSessionPlaceOfService(session) {
-  if (!session || session.place_of_service == null) return null;
-  const pos = String(session.place_of_service).trim();
-  if (pos === '' || isValidPlaceOfService(pos)) return null;
-  return pos;
-}
-
-// --- pre-submission sanity warnings (soft; NEVER hard-block) -----------------
-//
-// Computed server-side from the LIVE client + insurance records at submit time.
-// These surface likely intake mistakes (a parent completing a minor's intake with
-// their own DOB, a member id carrying extra card-prefix digits, an adult tagged as
-// a child dependent) that nothing else catches. They are advisory: the submit
-// proceeds when the caller passes confirmed:true. Messages may embed non-PHI
-// context (an age); only the CODES are ever written to the audit log.
-
-// Date-only key ('YYYY-MM-DD') for a pg date (JS Date or 'YYYY-MM-DD…' string), or null.
-function dateOnlyKey(v) {
-  if (v == null || v === '') return null;
-  const iso = v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10);
-  return /^\d{4}-\d{2}-\d{2}$/.test(iso) ? iso : null;
-}
-
-// Whole years between a date of birth and a reference date (default: now, UTC).
-// Null when the DOB can't be parsed. UTC math avoids timezone drift (Lambda = UTC).
-function ageInYears(dob, asOf) {
-  const key = dateOnlyKey(dob);
-  if (!key) return null;
-  const [by, bm, bd] = key.split('-').map(Number);
-  const ref = asOf instanceof Date ? asOf : new Date();
-  let age = ref.getUTCFullYear() - by;
-  const monthDelta = (ref.getUTCMonth() + 1) - bm;
-  if (monthDelta < 0 || (monthDelta === 0 && ref.getUTCDate() < bd)) age -= 1;
-  return age;
-}
-
-// Evaluate soft pre-submission warnings from { client, insurance }. Returns an
-// array of { code, message }. Pure and DB-free so it can be unit-tested; the
-// `asOf` param (default now) makes the age rule deterministic in tests.
-function evaluateSubmissionWarnings(ctx, asOf) {
-  const client = (ctx && ctx.client) || null;
-  const insurance = (ctx && ctx.insurance) || null;
-  const warnings = [];
-
-  const rel = insurance && insurance.subscriber_relationship
-    ? String(insurance.subscriber_relationship).trim().toLowerCase()
-    : '';
-  const isDependent = rel !== '' && rel !== 'self';
-
-  // 1. A "child" dependent who is an adult (>= 26) is usually a mis-tagged record.
-  if (rel === 'child' && client) {
-    const age = ageInYears(client.date_of_birth, asOf);
-    if (age != null && age >= 26) {
-      warnings.push({
-        code: 'child_dependent_adult_age',
-        message: `Patient is listed as a child dependent but is ${age} years old.`,
-      });
-    }
-  }
-
-  // 2. Patient and policyholder sharing a DOB on a dependent policy is a red flag
-  //    (e.g. a parent who entered their own DOB as the child's).
-  if (isDependent && client && insurance) {
-    const patientDob = dateOnlyKey(client.date_of_birth);
-    const subscriberDob = dateOnlyKey(insurance.subscriber_dob);
-    if (patientDob && subscriberDob && patientDob === subscriberDob) {
-      warnings.push({
-        code: 'patient_policyholder_same_dob',
-        message: 'Patient and policyholder have the same date of birth.',
-      });
-    }
-  }
-
-  // 3. A dependent claim with no policyholder name on the insurance record.
-  if (isDependent && insurance) {
-    const name = insurance.subscriber_name;
-    if (name == null || String(name).trim() === '') {
-      warnings.push({
-        code: 'dependent_missing_policyholder_name',
-        message: 'Dependent claim has no policyholder name.',
-      });
-    }
-  }
-
-  // 4. Member ID length outside the usual 5–20 characters (extra card-prefix
-  //    digits, a truncated id). Only when a member id is actually present.
-  if (insurance) {
-    const memberId = insurance.member_id == null ? '' : String(insurance.member_id).trim();
-    if (memberId !== '' && (memberId.length < 5 || memberId.length > 20)) {
-      warnings.push({
-        code: 'member_id_length_unusual',
-        message: 'Member ID length looks unusual.',
-      });
-    }
-  }
-
-  return warnings;
 }
 
 // Assemble the normalized context an adapter needs (no DB access in adapters).
@@ -617,17 +522,40 @@ async function listClaims(practiceId, event, authCtx) {
 
   // client_id / session_id are NOT NULL on claims, so inner-join those; the
   // insurance record is optional, so left-join it for the payer columns.
+  //
+  // ONE set-based query, never a per-claim loop: the readiness projection needs
+  // practice, client, insurance and session fields, so they are selected here
+  // alongside the display columns. practices is inner-joined on the claim's own
+  // practice_id (always present, one row) — it costs one join, not one query per
+  // claim. The insurance join is unchanged (still a plain left join, still
+  // unfiltered) so payer_name / payer_id keep their exact current values; the
+  // evaluator reads ins_is_hidden instead and treats a hidden record as absent,
+  // which is what submit's loadInsuranceRecord does.
   const res = await db.query(
     `select c.*,
             cl.first_name     as client_first_name,
             cl.last_name      as client_last_name,
             cl.preferred_name as client_preferred_name,
+            cl.date_of_birth  as client_date_of_birth,
             s.session_date    as session_date,
+            s.cpt_code        as session_cpt_code,
+            s.diagnosis_codes as session_diagnosis_codes,
+            s.place_of_service as session_place_of_service,
             ir.carrier_name   as payer_name,
-            ir.payer_id       as payer_id
+            ir.payer_id       as payer_id,
+            ir.is_hidden      as ins_is_hidden,
+            ir.member_id      as ins_member_id,
+            ir.subscriber_relationship as ins_subscriber_relationship,
+            ir.subscriber_name         as ins_subscriber_name,
+            ir.subscriber_dob          as ins_subscriber_dob,
+            pr.address_line1  as practice_address_line1,
+            pr.city           as practice_city,
+            pr.state          as practice_state,
+            pr.postal_code    as practice_postal_code
        from claims c
        join clients cl  on cl.id = c.client_id
        join sessions s  on s.id = c.session_id
+       join practices pr on pr.id = c.practice_id
        left join insurance_records ir on ir.id = c.insurance_record_id
       where ${where}
       order by c.created_at desc`,
@@ -760,8 +688,11 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   if (claim.status !== 'draft') {
     return json(409, { error: 'Only draft claims can be submitted.' }, event);
   }
-  if (!claim.insurance_record_id) {
-    return json(400, { error: 'Attach an insurance record before submitting.' }, event);
+  // Coverage to bill. Stays HERE — before the patient control number is minted
+  // and before any context is built — so a claim with no insurance is never
+  // mutated by a submit attempt. 400 (not 422) is the long-standing answer.
+  if (missingInsuranceRecord(claim)) {
+    return json(400, { error: BLOCKER_MESSAGES.missing_insurance_record }, event);
   }
 
   // Mint (or reuse) the <=20-char patient control number BEFORE building the
@@ -785,27 +716,21 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   // Block submission before it reaches the clearinghouse if the practice has no
   // billing address — otherwise Stedi 400s and the user sees an opaque 502.
   if (missingBillingAddressField(ctx.practice)) {
-    return json(422, {
-      error: 'Practice billing address is required before submitting claims.',
-    }, event);
+    return json(422, { error: BLOCKER_MESSAGES.practice_billing_address }, event);
   }
 
   // The subscriber's date of birth is required by the 837P. A client created by
   // staff may not have one yet (the client supplies it in the SMS intake), so
   // catch it here as a clean 422 rather than a downstream 500/502.
   if (missingSubscriberField(ctx.client)) {
-    return json(422, {
-      error: "Client date of birth is required before submitting claims. Ask the client to complete intake, or add it on the client's chart.",
-    }, event);
+    return json(422, { error: BLOCKER_MESSAGES.client_date_of_birth }, event);
   }
 
   // Dependent claims put the policyholder in the 837P subscriber loop, which
   // requires their name and date of birth. Block early with a clean 422 rather
   // than letting the incomplete record reach Stedi as an opaque error.
   if (missingDependentPolicyholderField(ctx.insurance)) {
-    return json(422, {
-      error: 'Policyholder name and date of birth are required on the insurance record before submitting a dependent claim. Edit the client\'s insurance to add them.',
-    }, event);
+    return json(422, { error: BLOCKER_MESSAGES.dependent_policyholder }, event);
   }
 
   // Place of service must be a valid two-character CMS code before the claim can
@@ -815,9 +740,7 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   // adapter defaults it to 11 (office).
   const sessionPlaceOfService = invalidSessionPlaceOfService(ctx.session);
   if (sessionPlaceOfService != null) {
-    return json(422, {
-      error: `Session place of service is not a valid CMS code. Edit the session and pick one of: ${PLACE_OF_SERVICE_CODES.map((e) => `${e.code} (${e.label})`).join(', ')}.`,
-    }, event);
+    return json(422, { error: placeOfServiceBlockerMessage() }, event);
   }
 
   // Replacement (CMS frequency 7) safety gate. A replacement asks the payer to
@@ -875,8 +798,8 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   // never the payer claim number it carries for the dialog.
   if (isReplacementClaim(claim)) {
     warnings.unshift({
-      code: 'replacement_claim',
-      message: 'This replaces a previously accepted payer claim — it does not create a new original claim.',
+      code: REPLACEMENT_WARNING.code,
+      message: REPLACEMENT_WARNING.message,
       payer_claim_control_number: cleanText(claim.payer_claim_control_number),
     });
   }
@@ -1602,6 +1525,11 @@ async function listEvents(practiceId, id, event) {
 
 // Exported for unit testing (Lambda only calls .handler): the billing-address
 // guard and the set of statuses whose claims may be regenerated from a session.
+//
+// The pure validators below are RE-EXPORTS of lib/claim_readiness.js — this
+// handler owns none of them any more. The names are kept because they are the
+// long-standing test surface; the implementations are the shared ones, so a test
+// against either module tests the same code.
 exports.missingBillingAddressField = missingBillingAddressField;
 exports.missingSubscriberField = missingSubscriberField;
 exports.missingDependentPolicyholderField = missingDependentPolicyholderField;
