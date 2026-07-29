@@ -1,15 +1,35 @@
 /* =============================================================================
- * Reddably — Calendar review (staged appointments → sessions)
+ * Reddably — Calendar (match client → scheduled session → confirm session)
  * =============================================================================
- * Registers under #calendar. A single newest-first list of staged calendar
- * appointments (unmatched + matched): confirm a suggested client, pick one by
- * hand, or ignore the row. Confirming creates the session (server-side) and the
- * row leaves the list. Built entirely on the shared kit (window.Reddably) and
- * ReddablyAPI — no direct fetch(), no raw hex/px, no new globals.
+ * Registers under #calendar. The view separates the two decisions that used to
+ * share one ambiguous "Confirm" button:
+ *
+ *   Sync → Match client → Scheduled session → Confirm session → Draft claim
+ *
+ *   * MATCH CLIENT  — the clinician says which client owns a calendar
+ *     appointment. Promotion (POST /calendar-events/{id}/promote) creates the
+ *     SCHEDULED session and flips the calendar event to match_state
+ *     'confirmed'. The calendar-event row is KEPT — promotion is not a delete,
+ *     and this view never issues one.
+ *   * CONFIRM SESSION — the clinician says an ENDED, calendar-linked scheduled
+ *     session actually happened. That is PATCH /sessions/{id}
+ *     { status: 'completed' }, and the server (transactionally, idempotently)
+ *     creates the draft claim and advances the session to 'claim_ready'. No
+ *     claim is ever created in frontend code.
+ *   * SUBMIT CLAIM — a later, explicit action in Claims. Untouched here.
+ *
+ * The "waiting to be confirmed" section is deliberately CROSS-RESOURCE and
+ * CALENDAR-SOURCED ONLY: it is the intersection of confirmed calendar events
+ * that carry a session_id and sessions still in 'scheduled'. A manually created
+ * session has no calendar event, so it never appears — this view only confirms
+ * appointments whose authoritative end time came from the calendar.
+ *
+ * Built entirely on the shared kit (window.Reddably) and ReddablyAPI — no direct
+ * fetch(), no raw hex/px, no new globals.
  *
  * White-labeled: the view is "Calendar", the button is "Sync now" — no vendor
- * names anywhere. Suggestion badges stay stone (neutral): a match is in-flight
- * work, not a resolved state.
+ * names anywhere. Match/scheduled badges stay stone (neutral): work in flight is
+ * not a resolved state.
  * ========================================================================== */
 (function (window, document) {
   'use strict';
@@ -32,11 +52,121 @@
     return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   }
 
+  // Epoch ms for a timestamp, or null when it is absent or unparseable. A null
+  // here is load-bearing: without an authoritative end time an appointment can
+  // never become confirmable.
+  function msOf(value) {
+    if (!value) return null;
+    var t = new Date(value).getTime();
+    return isNaN(t) ? null : t;
+  }
+
+  // Sort the calendar's four work buckets out of the four things we load.
+  //
+  //   data.pending   — events in match_state unmatched|matched (the review queue)
+  //   data.confirmed — events already promoted (match_state 'confirmed')
+  //   data.ignored   — events set aside
+  //   data.sessions  — sessions with status 'scheduled'
+  //
+  // Rules that matter:
+  //   * awaiting  = confirmed event WITH session_id  ∩  still-'scheduled' session
+  //     of that id, whose ends_at is valid AND already past. Missing/invalid
+  //     ends_at never makes a session confirmable, and session_date is never
+  //     used to decide it.
+  //   * upcoming  = non-ignored, non-cancelled events whose end is still ahead.
+  //   * matching  = unpromoted events that have ended (or that carry no end time
+  //     at all — all-day appointments sync with ends_at null, and they must stay
+  //     visible as work rather than silently vanish; they are placed by their
+  //     start so a FUTURE all-day appointment still reads as upcoming).
+  //   * Ordering is intentionally split: past work newest-first (ends_at DESC),
+  //     upcoming soonest-first (starts_at ASC).
+  //
+  // A promoted all-day appointment (no end time) is not confirmable from here;
+  // its session is completed from the client chart instead.
+  function buildWorkflow(data, nowMs) {
+    var pending = (data && data.pending) || [];
+    var confirmed = (data && data.confirmed) || [];
+    var ignoredEvents = (data && data.ignored) || [];
+    var sessions = (data && data.sessions) || [];
+    var awaiting = [];
+    var matching = [];
+    var upcoming = [];
+    var ignored = [];
+    var scheduledById = {};
+    sessions.forEach(function (s) {
+      if (s && s.id && s.status === 'scheduled') scheduledById[s.id] = s;
+    });
+    function item(ev, session) {
+      return { event: ev, session: session || null, startMs: msOf(ev.starts_at), endMs: msOf(ev.ends_at) };
+    }
+    function live(ev) {
+      return !!ev && ev.event_status !== 'cancelled';
+    }
+    // Already promoted: either still ahead (scheduled, nothing to do yet) or
+    // ended and waiting on the clinician's confirmation.
+    confirmed.filter(live).forEach(function (ev) {
+      var row = item(ev, null);
+      if (row.endMs === null) {
+        if (row.startMs !== null && row.startMs > nowMs) upcoming.push(row);
+        return;
+      }
+      if (row.endMs > nowMs) {
+        upcoming.push(row);
+        return;
+      }
+      var session = ev.session_id ? scheduledById[ev.session_id] : null;
+      if (!session) return;
+      row.session = session;
+      awaiting.push(row);
+    });
+    // Not promoted yet: still needs a client.
+    pending.filter(live).forEach(function (ev) {
+      if (ev.session_id) return;
+      var row = item(ev, null);
+      var ahead = row.endMs === null ? row.startMs !== null && row.startMs > nowMs : row.endMs > nowMs;
+      if (ahead) upcoming.push(row);
+      else matching.push(row);
+    });
+    ignoredEvents.filter(live).forEach(function (ev) {
+      ignored.push(item(ev, null));
+    });
+    function byEndDesc(a, b) {
+      var x = a.endMs === null ? -Infinity : a.endMs;
+      var y = b.endMs === null ? -Infinity : b.endMs;
+      if (x !== y) return y - x;
+      return (b.startMs || 0) - (a.startMs || 0);
+    }
+    function byStartAsc(a, b) {
+      var x = a.startMs === null ? Infinity : a.startMs;
+      var y = b.startMs === null ? Infinity : b.startMs;
+      return x - y;
+    }
+    awaiting.sort(byEndDesc);
+    matching.sort(byEndDesc);
+    ignored.sort(byEndDesc);
+    upcoming.sort(byStartAsc);
+    return { awaiting: awaiting, matching: matching, upcoming: upcoming, ignored: ignored };
+  }
+
   function inlineEmpty(text) {
     return h('p', {
       class: 'empty-state__body',
       style: 'margin:0;padding:var(--space-3) 0',
     }, text);
+  }
+
+  function sectionCard(title, note, body) {
+    return h('div', { class: 'card' }, [
+      h('div', { class: 'card__header' }, [
+        h('h2', { class: 'card__title' }, title),
+        note
+          ? h('p', {
+              style: 'margin:0;color:var(--color-text-muted);font-size:var(--font-size-2)',
+            }, note)
+          : null,
+      ]),
+      body,
+    ]);
   }
 
   function renderCalendar(root) {
@@ -45,26 +175,37 @@
     function load() {
       R.renderLoading(root);
       Promise.all([
+        // Default list = the review queue (unmatched + matched).
         api.calendarEvents.list(),
+        api.calendarEvents.list({ state: 'confirmed' }),
+        api.calendarEvents.list({ state: 'ignored' }),
+        api.sessions.list({ status: 'scheduled' }),
         api.clients.list(),
         // No active connection (404) or a provider hiccup must not take the
         // review list down — the picker just doesn't render.
         api.calendarConnections.calendars().catch(function () { return null; }),
       ]).then(function (results) {
-        var events = (results[0] && results[0].calendar_events) || [];
+        function eventsOf(res) { return (res && res.calendar_events) || []; }
         // Pickable clients: not soft-deleted (the API already excludes those)
         // and not inactive — mirrors the matcher's candidate set.
-        var clients = ((results[1] && results[1].clients) || []).filter(function (c) {
+        var clients = ((results[4] && results[4].clients) || []).filter(function (c) {
           return c.status !== 'inactive';
         });
-        render(events, clients, results[2]);
+        render({
+          pending: eventsOf(results[0]),
+          confirmed: eventsOf(results[1]),
+          ignored: eventsOf(results[2]),
+          sessions: (results[3] && results[3].sessions) || [],
+        }, clients, results[5]);
       }).catch(function (err) {
         R.renderError(root, err, load);
       });
     }
 
-    function render(events, clients, calInfo) {
+    function render(data, clients, calInfo) {
       R.clear(root);
+
+      var workflow = buildWorkflow(data, Date.now());
 
       // Display labels for the picker; duplicate names are disambiguated with
       // the date of birth so a choice is never silently the wrong person.
@@ -85,149 +226,265 @@
         return label;
       });
 
-      var pending = events.slice();
-      var countEl = h('p', {
-        style: 'margin:0;color:var(--color-text-muted);font-size:var(--font-size-3)',
-      });
-      var tbody = h('tbody');
+      // --- actions -----------------------------------------------------------
+      // Every action reloads on success: promotion KEEPS the calendar-event row
+      // and moves it between sections, so the view has to re-derive the buckets
+      // rather than splice a row out of the DOM.
 
-      function updateCount() {
-        countEl.textContent = pending.length === 0
-          ? 'No appointments waiting for review.'
-          : pending.length + (pending.length === 1
-            ? ' appointment waiting for review.'
-            : ' appointments waiting for review.');
-      }
-
-      function removeRow(ev, rowEls) {
-        pending = pending.filter(function (e) { return e.id !== ev.id; });
-        rowEls.forEach(function (el) { if (el.parentNode) el.parentNode.removeChild(el); });
-        updateCount();
-        if (!pending.length) paint();
-      }
-
-      function confirm(ev, clientId, rowEls, buttons) {
+      function matchClient(ev, clientId, buttons) {
         buttons.forEach(function (b) { b.disabled = true; });
         api.calendarEvents.promote(ev.id, clientId).then(function (res) {
           var session = res && res.session;
           // Surface the session date so a timezone error is visible immediately.
           var when = session && session.session_date ? R.fmtDate(session.session_date) : null;
-          R.toast(when ? 'Session created for ' + when : 'Session created', 'success');
-          removeRow(ev, rowEls);
+          R.toast(when
+            ? 'Client matched — session scheduled for ' + when
+            : 'Client matched — session scheduled', 'success');
+          load();
         }).catch(function (err) {
           buttons.forEach(function (b) { b.disabled = false; });
-          R.toast(err.message || 'Could not confirm this appointment.', 'error');
+          R.toast((err && err.message) || 'Could not match this appointment.', 'error');
         });
       }
 
-      function ignore(ev, rowEls, buttons) {
+      // The ended, calendar-linked session actually happened. The server creates
+      // the draft claim inside its own transaction — never this view.
+      function confirmSession(row, buttons) {
+        buttons.forEach(function (b) { b.disabled = true; });
+        api.sessions.update(row.session.id, { status: 'completed' }).then(function (res) {
+          R.toast(res && res.claim_created === true
+            ? 'Session confirmed — claim draft ready in Claims.'
+            : 'Session confirmed.', 'success');
+          load();
+        }).catch(function (err) {
+          buttons.forEach(function (b) { b.disabled = false; });
+          R.toast((err && err.message) || 'Could not confirm this session.', 'error');
+        });
+      }
+
+      function ignore(ev, buttons) {
         buttons.forEach(function (b) { b.disabled = true; });
         api.calendarEvents.ignore(ev.id).then(function () {
           R.toast('Appointment ignored', 'success');
-          removeRow(ev, rowEls);
+          load();
         }).catch(function (err) {
           buttons.forEach(function (b) { b.disabled = false; });
-          R.toast(err.message || 'Could not ignore this appointment.', 'error');
+          R.toast((err && err.message) || 'Could not ignore this appointment.', 'error');
         });
       }
 
-      // The Client cell + action buttons for one row. mode 'suggested' shows the
-      // matched client with Confirm / Change; 'picker' shows the searchable
-      // client input with Confirm. Change re-renders the same row in picker mode.
-      function paintRow(ev, row, mode) {
-        R.clear(row);
-        var buttons = [];
-        var actions;
-        var clientCell;
+      // --- row builders ------------------------------------------------------
 
-        var ignoreBtn = h('button', {
-          class: 'btn btn--ghost btn--sm', type: 'button',
-          style: 'margin-left:var(--space-2)',
-          onClick: function () { ignore(ev, [row], buttons); },
-        }, 'Ignore');
-
-        if (mode === 'suggested') {
-          var confidence = ev.match_confidence != null
-            ? Math.round(Number(ev.match_confidence)) + '%'
-            : null;
-          clientCell = h('td', null, [
-            h('span', null, ev.matched_client_name || '—'),
-            confidence
-              ? h('span', { class: 'badge badge--neutral',
-                  style: 'margin-left:var(--space-2)' }, confidence + ' match')
-              : null,
-          ]);
-          var confirmBtn = h('button', {
-            class: 'btn btn--primary btn--sm', type: 'button',
-            onClick: function () { confirm(ev, ev.matched_client_id, [row], buttons); },
-          }, 'Confirm');
-          var changeBtn = h('button', {
-            class: 'btn btn--ghost btn--sm', type: 'button',
-            style: 'margin-left:var(--space-2)',
-            onClick: function () { paintRow(ev, row, 'picker'); },
-          }, 'Change');
-          buttons.push(confirmBtn, changeBtn, ignoreBtn);
-          actions = h('td', { class: 'data-table__num' }, [confirmBtn, changeBtn, ignoreBtn]);
-        } else {
-          // Searchable select over the practice's active clients (native
-          // datalist type-ahead). Confirm enables only on an exact pick.
-          var listId = 'calendar-client-options-' + ev.id;
-          var pickerConfirm = h('button', {
-            class: 'btn btn--primary btn--sm', type: 'button', disabled: 'disabled',
-          }, 'Confirm');
-          var input = h('input', {
-            class: 'field__control',
-            type: 'text',
-            list: listId,
-            placeholder: clients.length ? 'Search clients…' : 'No active clients',
-            'aria-label': 'Choose a client for this appointment',
-            style: 'max-width:16rem;font-size:var(--font-size-2)',
-            onInput: function (e) {
-              pickerConfirm.disabled = !labelToId[e.target.value];
-            },
-          });
-          if (!clients.length) input.disabled = true;
-          pickerConfirm.addEventListener('click', function () {
-            var clientId = labelToId[input.value];
-            if (clientId) confirm(ev, clientId, [row], buttons);
-          });
-          clientCell = h('td', null, [
-            input,
-            h('datalist', { id: listId },
-              pickerOptions.map(function (label) { return h('option', { value: label }); })),
-          ]);
-          buttons.push(pickerConfirm, ignoreBtn);
-          actions = h('td', { class: 'data-table__num' }, [
-            pickerConfirm,
-            ignoreBtn,
-          ]);
-        }
-
-        [
+      function contextCells(ev) {
+        return [
           h('td', null, R.fmtDate(ev.starts_at)),
           h('td', null, fmtTime(ev.starts_at)),
           h('td', null, ev.duration_minutes != null ? ev.duration_minutes + ' min' : '—'),
           h('td', null, ev.summary_raw || '—'),
-          clientCell,
-          actions,
-        ].forEach(function (cell) { row.appendChild(cell); });
+        ];
       }
 
-      function paint() {
-        R.clear(tbody);
-        if (!pending.length) {
-          tbody.appendChild(h('tr', null,
-            h('td', { colspan: '6' },
-              inlineEmpty('Nothing to review. Sync to pull in new appointments.'))));
-          return;
-        }
-        pending.forEach(function (ev) {
-          var row = h('tr');
-          paintRow(ev, row, ev.match_state === 'matched' && ev.matched_client_id
-            ? 'suggested' : 'picker');
-          tbody.appendChild(row);
-        });
+      // A matched-client cell with the suggestion badge (stone: a suggestion is
+      // in-flight work, not a resolved state).
+      function suggestionCell(ev) {
+        var confidence = ev.match_confidence != null
+          ? Math.round(Number(ev.match_confidence)) + '%'
+          : null;
+        return h('td', null, [
+          h('span', null, ev.matched_client_name || '—'),
+          confidence
+            ? h('span', {
+                class: 'badge badge--neutral',
+                style: 'margin-left:var(--space-2)',
+              }, confidence + ' match')
+            : null,
+        ]);
       }
+
+      // The searchable client picker (native datalist type-ahead). "Match client"
+      // enables only on an exact pick, so a half-typed name can never promote.
+      function pickerCell(ev, buttons) {
+        var listId = 'calendar-client-options-' + ev.id;
+        var matchBtn = h('button', {
+          class: 'btn btn--primary btn--sm', type: 'button', disabled: 'disabled',
+        }, 'Match client');
+        var input = h('input', {
+          class: 'field__control',
+          type: 'text',
+          list: listId,
+          placeholder: clients.length ? 'Search clients…' : 'No active clients',
+          'aria-label': 'Choose a client for this appointment',
+          style: 'max-width:16rem;font-size:var(--font-size-2)',
+          onInput: function (e) {
+            matchBtn.disabled = !labelToId[e.target.value];
+          },
+        });
+        if (!clients.length) input.disabled = true;
+        matchBtn.addEventListener('click', function () {
+          var clientId = labelToId[input.value];
+          if (clientId) matchClient(ev, clientId, buttons);
+        });
+        return {
+          cell: h('td', null, [
+            input,
+            h('datalist', { id: listId },
+              pickerOptions.map(function (label) { return h('option', { value: label }); })),
+          ]),
+          button: matchBtn,
+        };
+      }
+
+      // One row of a matching section. mode 'suggested' offers the matched client
+      // with Match client / Change; 'picker' offers the searchable input. Change
+      // repaints the same row in picker mode.
+      function paintMatchRow(ev, row, mode, showIgnore) {
+        R.clear(row);
+        var buttons = [];
+        var actionEls = [];
+        var clientCell;
+
+        if (mode === 'suggested' && ev.matched_client_id) {
+          clientCell = suggestionCell(ev);
+          var matchBtn = h('button', {
+            class: 'btn btn--primary btn--sm', type: 'button',
+            onClick: function () { matchClient(ev, ev.matched_client_id, buttons); },
+          }, 'Match client');
+          var changeBtn = h('button', {
+            class: 'btn btn--ghost btn--sm', type: 'button',
+            style: 'margin-left:var(--space-2)',
+            onClick: function () { paintMatchRow(ev, row, 'picker', showIgnore); },
+          }, 'Change');
+          buttons.push(matchBtn, changeBtn);
+          actionEls.push(matchBtn, changeBtn);
+        } else {
+          var picked = pickerCell(ev, buttons);
+          clientCell = picked.cell;
+          buttons.push(picked.button);
+          actionEls.push(picked.button);
+        }
+
+        if (showIgnore) {
+          var ignoreBtn = h('button', {
+            class: 'btn btn--ghost btn--sm', type: 'button',
+            style: 'margin-left:var(--space-2)',
+            onClick: function () { ignore(ev, buttons); },
+          }, 'Ignore');
+          buttons.push(ignoreBtn);
+          actionEls.push(ignoreBtn);
+        }
+
+        contextCells(ev).concat([
+          clientCell,
+          h('td', { class: 'data-table__num' }, actionEls),
+        ]).forEach(function (cell) { row.appendChild(cell); });
+      }
+
+      // An already-promoted upcoming appointment: scheduled state only. No
+      // Confirm session before the appointment ends, and no second session.
+      function paintScheduledRow(ev, row) {
+        R.clear(row);
+        contextCells(ev).concat([
+          h('td', null, ev.matched_client_name || '—'),
+          h('td', { class: 'data-table__num' },
+            h('span', { class: 'badge badge--neutral' }, 'Scheduled')),
+        ]).forEach(function (cell) { row.appendChild(cell); });
+      }
+
+      // The one dominant action of the whole view.
+      function paintConfirmRow(item, row) {
+        R.clear(row);
+        var buttons = [];
+        var confirmBtn = h('button', {
+          class: 'btn btn--primary btn--sm', type: 'button',
+          onClick: function () { confirmSession(item, buttons); },
+        }, 'Confirm session');
+        buttons.push(confirmBtn);
+        contextCells(item.event).concat([
+          h('td', null, item.event.matched_client_name || '—'),
+          h('td', { class: 'data-table__num' }, confirmBtn),
+        ]).forEach(function (cell) { row.appendChild(cell); });
+      }
+
+      // --- sections ----------------------------------------------------------
+
+      function sectionTable(clientHeading, rows, emptyText) {
+        var tbody = h('tbody');
+        if (!rows.length) {
+          tbody.appendChild(h('tr', null,
+            h('td', { colspan: '6' }, inlineEmpty(emptyText))));
+        } else {
+          rows.forEach(function (paint) {
+            var row = h('tr');
+            paint(row);
+            tbody.appendChild(row);
+          });
+        }
+        return h('table', { class: 'data-table' }, [
+          h('thead', null, h('tr', null, [
+            h('th', null, 'Date'),
+            h('th', null, 'Time'),
+            h('th', null, 'Duration'),
+            h('th', null, 'Appointment'),
+            h('th', null, clientHeading),
+            h('th', { class: 'data-table__num' }, ''),
+          ])),
+          tbody,
+        ]);
+      }
+
+      var awaitingCard = sectionCard(
+        'Sessions to confirm',
+        'Appointments that have ended. Confirming creates the draft claim.',
+        sectionTable('Client', workflow.awaiting.map(function (item) {
+          return function (row) { paintConfirmRow(item, row); };
+        }), 'No sessions waiting to be confirmed.')
+      );
+
+      var matchingCard = sectionCard(
+        'Appointments needing a client',
+        'Past appointments that were never matched. Matching schedules the session.',
+        sectionTable('Client', workflow.matching.map(function (item) {
+          var ev = item.event;
+          return function (row) {
+            paintMatchRow(ev, row,
+              ev.match_state === 'matched' && ev.matched_client_id ? 'suggested' : 'picker',
+              true);
+          };
+        }), 'No past appointments waiting for a client.')
+      );
+
+      var upcomingCard = sectionCard(
+        'Upcoming appointments',
+        'Match a client ahead of time. Confirming waits until the appointment ends.',
+        sectionTable('Client', workflow.upcoming.map(function (item) {
+          var ev = item.event;
+          return function (row) {
+            if (ev.session_id) {
+              paintScheduledRow(ev, row);
+              return;
+            }
+            paintMatchRow(ev, row,
+              ev.match_state === 'matched' && ev.matched_client_id ? 'suggested' : 'picker',
+              true);
+          };
+        }), 'No upcoming appointments. Sync to pull in new appointments.')
+      );
+
+      // Subordinate: set aside, but reversible — matching one still promotes it.
+      var ignoredCard = sectionCard(
+        'Ignored appointments',
+        'Set aside. Matching a client still schedules the session.',
+        sectionTable('Client', workflow.ignored.map(function (item) {
+          var ev = item.event;
+          return function (row) {
+            paintMatchRow(ev, row,
+              ev.match_state === 'matched' && ev.matched_client_id ? 'suggested' : 'picker',
+              false);
+          };
+        }), 'No ignored appointments.')
+      );
+
+      // --- shell -------------------------------------------------------------
 
       var syncBtn = h('button', {
         class: 'btn btn--primary', type: 'button',
@@ -238,7 +495,7 @@
             load();
           }).catch(function (err) {
             syncBtn.disabled = false;
-            R.toast(err.message || 'Could not sync your calendar.', 'error');
+            R.toast((err && err.message) || 'Could not sync your calendar.', 'error');
           });
         },
       }, 'Sync now');
@@ -267,8 +524,8 @@
           if (!chosen || (current && chosen.id === current.id)) return;
           var ok = window.confirm(
             'Switch syncing to "' + chosen.name + '"?\n\n' +
-            'Staged appointments not yet confirmed will be cleared. ' +
-            'Confirmed sessions are kept.'
+            'Staged appointments not yet matched to a client will be cleared. ' +
+            'Scheduled sessions are kept.'
           );
           if (!ok) {
             picker.value = current ? current.id : '';
@@ -288,7 +545,7 @@
               picker.disabled = false;
               syncBtn.disabled = false;
               picker.value = current ? current.id : '';
-              R.toast(err.message || 'Could not switch calendars.', 'error');
+              R.toast((err && err.message) || 'Could not switch calendars.', 'error');
             });
         });
         calendarPicker = h('label', {
@@ -297,28 +554,18 @@
         }, ['Syncing', picker]);
       }
 
-      var table = h('table', { class: 'data-table' }, [
-        h('thead', null, h('tr', null, [
-          h('th', null, 'Date'),
-          h('th', null, 'Time'),
-          h('th', null, 'Duration'),
-          h('th', null, 'Appointment'),
-          h('th', null, 'Client'),
-          h('th', { class: 'data-table__num' }, ''),
-        ])),
-        tbody,
-      ]);
-
-      updateCount();
-      paint();
-
       root.appendChild(h('div', { class: 'view stack' }, [
         h('div', { class: 'page-header' }, [
           h('h1', { class: 'page-header__title' }, 'Calendar'),
           h('div', { class: 'page-header__actions' }, [calendarPicker, syncBtn]),
         ]),
-        countEl,
-        h('div', { class: 'card' }, table),
+        h('p', {
+          style: 'margin:0;color:var(--color-text-muted);font-size:var(--font-size-3)',
+        }, 'Match each appointment to a client, then confirm the session once it has ended.'),
+        awaitingCard,
+        matchingCard,
+        upcomingCard,
+        ignoredCard,
       ]));
     }
 
