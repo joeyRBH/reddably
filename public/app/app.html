@@ -231,11 +231,14 @@
   <script src="./views.js?v=20260717a"></script>
   <!-- Plan state + topbar plan badge (window.ReddablyPlan). -->
   <script src="./plan.js?v=20260715a"></script>
+  <!-- Shared calendar workflow classifier (window.Reddably.workflow) — must load
+       after views.js creates the namespace and before Dashboard and Calendar. -->
+  <script src="./workflow.js?v=20260728c"></script>
   <!-- Views (register into the router). -->
-  <script src="./views/dashboard.js?v=20260715a"></script>
+  <script src="./views/dashboard.js?v=20260728c"></script>
   <script src="./views/clients.js?v=20260715a"></script>
   <script src="./views/claims.js?v=20260728b"></script>
-  <script src="./views/calendar.js?v=20260728a"></script>
+  <script src="./views/calendar.js?v=20260728c"></script>
   <script src="./views/clinicians.js?v=20260715a"></script>
   <script src="./views/reports.js?v=20260715a"></script>
   <script src="./views/settings.js?v=20260715a"></script>
