@@ -269,9 +269,23 @@ const Reddably = {
 
 const fakeWindow = { Reddably: Reddably, confirm: () => false, setTimeout: setTimeout };
 
+const sandbox = {
+  window: fakeWindow, document: fakeDocument, console: console, Promise: Promise, Date: Date,
+};
+
+// The workflow bucketing is no longer part of the view: it is the shared
+// classifier at public/app/workflow.js, which Dashboard reads too. Load the
+// REAL module (not a stub) so this test still exercises the real rules.
+vm.runInNewContext(
+  fs.readFileSync(path.join(__dirname, '..', '..', 'public', 'app', 'workflow.js'), 'utf8'),
+  sandbox
+);
+assert.ok(Reddably.workflow && typeof Reddably.workflow.buildCalendarWorkflow === 'function',
+  'workflow.js attaches buildCalendarWorkflow to the shared namespace');
+
 vm.runInNewContext(
   fs.readFileSync(path.join(__dirname, '..', '..', 'public', 'app', 'views', 'calendar.js'), 'utf8'),
-  { window: fakeWindow, document: fakeDocument, console: console, Promise: Promise, Date: Date }
+  sandbox
 );
 
 assert.ok(typeof viewFn === 'function', 'calendar.js registers the calendar view');

@@ -7,8 +7,13 @@
 //
 //   Sync -> Match client -> Scheduled session -> Confirm session -> Draft claim
 //
-// buildWorkflow() is the pure function that sorts the loaded resources into the
-// view's four sections. It is the safety boundary, so it is pinned here:
+// buildCalendarWorkflow() is the pure function that sorts the loaded resources
+// into the view's four sections. It now lives in public/app/workflow.js
+// (window.Reddably.workflow) — ONE classifier shared by Calendar and the
+// Dashboard, so the two surfaces can never disagree about what is waiting. Its
+// behavior is unchanged by that move, which is exactly what this file pins.
+//
+// It is the safety boundary, so it is pinned here:
 //
 //   * "waiting to be confirmed" is CROSS-RESOURCE and CALENDAR-SOURCED ONLY —
 //     the intersection of confirmed calendar events carrying a session_id and
@@ -35,22 +40,26 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const CALENDAR_JS = path.join(__dirname, '..', '..', 'public', 'app', 'views', 'calendar.js');
+const DASHBOARD_JS = path.join(__dirname, '..', '..', 'public', 'app', 'views', 'dashboard.js');
+const WORKFLOW_JS = path.join(__dirname, '..', '..', 'public', 'app', 'workflow.js');
 const APP_HTML = path.join(__dirname, '..', '..', 'public', 'app', 'app.html');
 
 const src = fs.readFileSync(CALENDAR_JS, 'utf8');
+const dashboardSrc = fs.readFileSync(DASHBOARD_JS, 'utf8');
+const workflowSrc = fs.readFileSync(WORKFLOW_JS, 'utf8');
 
 // Pull a 2-space-indented function out of the IIFE (its closing brace is the
 // first `\n  }` after the declaration).
 function extract(name) {
-  const start = src.indexOf('function ' + name + '(');
-  assert.ok(start !== -1, name + ' is defined in public/app/views/calendar.js');
-  const end = src.indexOf('\n  }', start);
+  const start = workflowSrc.indexOf('function ' + name + '(');
+  assert.ok(start !== -1, name + ' is defined in public/app/workflow.js');
+  const end = workflowSrc.indexOf('\n  }', start);
   assert.ok(end !== -1, 'found the end of ' + name);
-  return src.slice(start, end + 4);
+  return workflowSrc.slice(start, end + 4);
 }
 
 const buildWorkflow = new Function(
-  extract('msOf') + '\n' + extract('buildWorkflow') + '\nreturn buildWorkflow;'
+  extract('msOf') + '\n' + extract('buildCalendarWorkflow') + '\nreturn buildCalendarWorkflow;'
 )();
 
 // --- fixtures ----------------------------------------------------------------
@@ -289,12 +298,64 @@ assert.ok(!/\bfetch\(/.test(code), 'no direct fetch() in the view');
 // Design tokens only: no raw hex.
 assert.ok(!/#[0-9a-fA-F]{3,8}\b/.test(code), 'no raw hex colors — semantic tokens only');
 
-// --- 9. the calendar.js cache-buster moved -----------------------------------
+// --- 9. ONE classifier, shared by Calendar and Dashboard ---------------------
+
+// The implementation lives in workflow.js and attaches to the EXISTING
+// namespace — not a new global.
+assert.ok(/function buildCalendarWorkflow\(data, nowMs\)/.test(workflowSrc),
+  'public/app/workflow.js owns the classifier');
+assert.ok(/R\.workflow\s*=\s*\{/.test(workflowSrc) && /var R = window\.Reddably;/.test(workflowSrc),
+  'it hangs off window.Reddably, creating no unrelated global');
+assert.ok(!/window\.[A-Za-z_$][\w$]*\s*=/.test(
+  workflowSrc.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+), 'workflow.js assigns no new window global');
+
+// Both views consume that one function...
+[[src, 'calendar.js'], [dashboardSrc, 'dashboard.js']].forEach(([text, name]) => {
+  assert.ok(/R\.workflow(\s*&&\s*R\.workflow)?\.buildCalendarWorkflow|workflow\.buildCalendarWorkflow/.test(text),
+    name + ' calls the shared buildCalendarWorkflow');
+  // ...and neither keeps a copy of the rules.
+  assert.ok(!/function buildWorkflow\s*\(/.test(text),
+    name + ' contains no copied buildWorkflow implementation');
+  assert.ok(!/function buildCalendarWorkflow\s*\(/.test(text),
+    name + ' does not re-implement the classifier');
+  assert.ok(!/function msOf\s*\(/.test(text),
+    name + ' does not re-implement the end-time parser');
+});
+
+// --- 10. script order + cache-busters ----------------------------------------
 
 const appHtml = fs.readFileSync(APP_HTML, 'utf8');
+
 const bust = appHtml.match(/\.\/views\/calendar\.js\?v=([^"']+)/);
 assert.ok(bust, 'app.html loads views/calendar.js with a cache-buster');
 assert.notStrictEqual(bust[1], '20260715a',
   'the calendar.js cache-buster is bumped off its pre-change value');
+
+// The shared helper has to be defined before either consumer registers.
+const iWorkflow = appHtml.indexOf('./workflow.js?v=');
+const iViews = appHtml.indexOf('./views.js?v=');
+const iDashboard = appHtml.indexOf('./views/dashboard.js?v=');
+const iCalendar = appHtml.indexOf('./views/calendar.js?v=');
+assert.ok(iWorkflow !== -1, 'app.html loads ./workflow.js');
+assert.ok(iViews !== -1 && iViews < iWorkflow,
+  'workflow.js loads after views.js, which creates window.Reddably');
+assert.ok(iWorkflow < iDashboard && iWorkflow < iCalendar,
+  'workflow.js loads before both the Dashboard and Calendar views');
+
+// Exactly the three intended assets move; Claims and the rest stay put.
+const VERSION = '20260728c';
+['./workflow.js', './views/dashboard.js', './views/calendar.js'].forEach((asset) => {
+  const m = appHtml.match(new RegExp(asset.replace(/[.\/]/g, '\\$&') + '\\?v=([^"\']+)'));
+  assert.ok(m, 'app.html loads ' + asset);
+  assert.strictEqual(m[1], VERSION, asset + ' carries the PR cache-buster');
+});
+const claimsBust = appHtml.match(/\.\/views\/claims\.js\?v=([^"']+)/);
+assert.strictEqual(claimsBust && claimsBust[1], '20260728b',
+  'the Claims cache-buster is untouched by this change');
+assert.strictEqual(
+  (appHtml.match(new RegExp('\\?v=' + VERSION, 'g')) || []).length, 3,
+  'exactly three assets carry the new cache-buster'
+);
 
 console.log('PASS calendar_workflow.test.js');
