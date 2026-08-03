@@ -68,9 +68,18 @@ an API Gateway HTTP API, and the ACM cert + custom domain.
 4. **Package the Lambda artifact** — install backend deps so `node_modules` is
    present; `archive_file` zips `/backend` at plan time:
    ```bash
-   cd ../../backend && npm install --omit=dev && cd -
+   cd ../../backend && npm ci --omit=dev && cd -
    ```
-   Neither `node_modules` nor `.build/claimsub-backend.zip` is committed.
+   Use `npm ci` (not `npm install`) so the install exactly matches the committed
+   `backend/package-lock.json`. Neither `node_modules` nor
+   `.build/claimsub-backend.zip` is committed — which is why this step is
+   **mandatory on every fresh checkout**: `archive_file` zips whatever is on
+   disk, and a deploy from a clone without `node_modules` shipped
+   dependency-less zips that failed every Lambda at cold start with
+   `MODULE_NOT_FOUND` (prod outage, 2026-08-03). Two safety nets now exist:
+   `lambda.tf` preconditions fail `terraform plan`/`apply` fast if
+   `node_modules` is missing or stale relative to the lockfile, and
+   `./deploy.sh` runs the `npm ci` automatically before applying.
 
 ---
 
@@ -175,7 +184,7 @@ terraform apply -target=aws_ssm_parameter.secure
 
 # 4. LAMBDA — the three functions, log groups, IAM
 #    First: build the backend zip (deps + bundle the schema for the migrate Lambda):
-#      (cd ../../backend && npm install --omit=dev && npm run bundle:schema)
+#      (cd ../../backend && npm ci --omit=dev && npm run bundle:schema)
 terraform apply \
   -target=aws_iam_role.lambda_exec \
   -target=aws_iam_role_policy.lambda_runtime \
@@ -257,7 +266,7 @@ Prerequisites (already covered by the apply order above):
 
 - The DB exists and `/claimsub/prod/DATABASE_URL` is seeded (apply steps 2–3).
 - The backend zip was built with the schema bundled in:
-  `(cd ../../backend && npm install --omit=dev && npm run bundle:schema)`.
+  `(cd ../../backend && npm ci --omit=dev && npm run bundle:schema)`.
 - `create_ssm_vpc_endpoint = true` (default) so the Lambda can reach SSM.
 
 Apply the migrate resources, then invoke:
