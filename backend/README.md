@@ -95,7 +95,7 @@ it into the bundle (the copy lands in `backend/sql/`, which is gitignored):
 
 ```bash
 cd backend
-npm install --omit=dev   # node_modules for the auth handlers
+npm ci --omit=dev        # node_modules for the handlers, exactly per package-lock.json
 npm run bundle:schema     # db/schema.sql -> backend/sql/schema.sql
 # then `terraform apply` zips /backend (see infra/terraform/README.md)
 ```

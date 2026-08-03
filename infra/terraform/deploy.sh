@@ -10,11 +10,20 @@ cd "$(dirname "$0")"
 
 command -v jq >/dev/null 2>&1 || { echo "jq is required (brew install jq)"; exit 2; }
 
+# Install backend runtime deps from the committed lockfile. archive_file zips
+# backend/ verbatim, so whatever node_modules holds right now IS the prod
+# artifact — a fresh clone has none, and deploying from one shipped
+# dependency-less zips that 500'd every Lambda at cold start (prod outage,
+# 2026-08-03). `npm ci` is reproducible (exact lockfile versions, clean
+# node_modules); lambda.tf additionally refuses to plan if this step was
+# skipped or node_modules drifted from the lockfile.
+echo ">> installing backend deps (npm ci --omit=dev)"
+( cd ../../backend && npm ci --omit=dev --no-audit --no-fund )
+
 # Refresh the schema bundle the migrate Lambda ships (db/schema.sql is the single
 # source of truth; backend/sql/schema.sql is gitignored and regenerated). Running
 # it here means a schema change can never silently deploy a stale copy. Pure fs
-# copy — no external deps. (node_modules is still installed out-of-band per
-# lambda.tf: `cd backend && npm install --omit=dev`.)
+# copy — no external deps.
 echo ">> bundling schema (db/schema.sql -> backend/sql/schema.sql)"
 ( cd ../../backend && npm run --silent bundle:schema )
 
