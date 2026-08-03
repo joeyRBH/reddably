@@ -8,9 +8,9 @@
 # still no internet. SecureString decryption with the default aws/ssm key is done
 # service-side by SSM, so no KMS endpoint is required.
 #
-# Gated by create_ssm_vpc_endpoint (default true). You may set it false to destroy
-# the endpoint - and stop its hourly per-AZ cost - once the schema is applied; the
-# migrate Lambda just can't reach SSM again until it is recreated.
+# Gated by create_ssm_vpc_endpoint (default false since the NAT gateway - nat.tf -
+# gives the Lambda SG a 443 egress path to SSM's public endpoint). Set true to
+# recreate a private SSM path if the NAT is ever removed.
 # =============================================================================
 
 resource "aws_security_group" "ssm_endpoint" {

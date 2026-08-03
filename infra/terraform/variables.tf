@@ -66,11 +66,13 @@ variable "create_ssm_vpc_endpoint" {
   description = <<-EOT
     Create an SSM interface endpoint so in-VPC Lambdas can read SSM parameters at
     runtime with no NAT (used by the one-off migrate Lambda; see migrate.tf and
-    vpc-endpoints.tf). Bills hourly per AZ - you may set false to destroy it once
-    the schema has been applied.
+    vpc-endpoints.tf). Bills hourly per AZ (~$15/month across 2 AZs). Default
+    false since the NAT gateway (nat.tf, enable_nat_gateway) now provides the
+    Lambdas' path to SSM; set true only if the NAT is ever removed while the
+    migrate Lambda still needs SSM at runtime.
   EOT
   type        = bool
-  default     = true
+  default     = false
 }
 
 # ─────────────────────────────────────────────────────────────
