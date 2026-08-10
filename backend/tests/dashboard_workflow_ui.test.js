@@ -169,6 +169,23 @@ function labels(root) {
 const NOW = Date.parse('2026-07-28T18:00:00Z');
 const T = (iso) => new Date(iso).toISOString();
 
+// The view classifies against Date.now() (dashboard.js: attentionCounts(data,
+// Date.now())), so the sandbox gets a FROZEN clock pinned to NOW — the same
+// instant this file's own buildCalendarWorkflow() calls use.
+//
+// Without it the test was wall-clock dependent and silently rotted: fixtures
+// dated 2026-07-28..30 were "future" to the assertions but drifted into the past
+// for the render, so the counts diverged and the file began failing on its own
+// once real time passed 2026-07-30. Parsing behaviour is untouched — only an
+// argument-less `new Date()` and `Date.now()` are pinned.
+class FrozenDate extends Date {
+  constructor(...args) {
+    if (args.length === 0) super(NOW);
+    else super(...args);
+  }
+  static now() { return NOW; }
+}
+
 function ev(id, over) {
   return Object.assign({
     id, summary_raw: 'Appointment ' + id, starts_at: null, ends_at: null,
@@ -269,7 +286,7 @@ const Reddably = {
 };
 
 const fakeWindow = { Reddably };
-const sandbox = { window: fakeWindow, document: fakeDocument, console, Promise, Date };
+const sandbox = { window: fakeWindow, document: fakeDocument, console, Promise, Date: FrozenDate };
 
 // The shared classifier is loaded for real — this test must exercise the code
 // that actually ships, not a stub that could agree with a bug.
@@ -326,7 +343,9 @@ async function mount(data, opts) {
     match_state: 'confirmed', session_id: 's-future',
     starts_at: T('2026-07-30T14:00:00Z'), ends_at: T('2026-07-30T15:00:00Z'),
   });
-  // Promoted and ended, but no usable end time -> never confirmable.
+  // Promoted and past, with no end time at all (an all-day appointment). Placed
+  // by its start, so it IS confirmation work — and the Dashboard has to count it
+  // exactly as the Calendar tab lists it.
   const E_NO_END = ev('e-no-end', {
     match_state: 'confirmed', session_id: 's-no-end',
     starts_at: T('2026-07-26T00:00:00Z'), ends_at: null,
@@ -388,21 +407,31 @@ async function mount(data, opts) {
   assert.strictEqual(cardValue(cardByLabel(root, 'Appointments to match')), '2',
     'both unpromoted pending events count; promoted ones do not');
 
-  // 3. Sessions to confirm: the shared classifier's awaiting bucket. The future
-  //    appointment, the end-time-less one, and the manual session are all out.
-  assert.strictEqual(cardValue(cardByLabel(root, 'Sessions to confirm')), '1',
-    'only the ended, calendar-linked, still-scheduled session counts');
+  // 3. Sessions to confirm: the shared classifier's awaiting bucket. The ended
+  //    session and the past all-day one both count; the future appointment and
+  //    the manual session are out.
+  assert.strictEqual(cardValue(cardByLabel(root, 'Sessions to confirm')), '2',
+    'every past, calendar-linked, still-scheduled session counts');
 
   //    Pinned against the classifier itself, so the two can never drift.
   const wf = Reddably.workflow.buildCalendarWorkflow({
     pending: FULL.pending, confirmed: FULL.confirmed, sessions: FULL.sessions,
   }, NOW);
-  assert.strictEqual(wf.awaiting.length, 1, 'the shared classifier agrees');
-  assert.strictEqual(wf.awaiting[0].session.id, 's-ended');
+  assert.strictEqual(wf.awaiting.length, 2, 'the shared classifier agrees');
+  // Array.from rehomes the vm-context array — deepStrictEqual compares
+  // prototypes, and a cross-realm Array fails on identity alone.
+  assert.deepStrictEqual(Array.from(wf.awaiting, (r) => r.session.id).sort(),
+    ['s-ended', 's-no-end'],
+    'the ended session and the past all-day one, and nothing else');
   assert.ok(!wf.awaiting.some((r) => r.session && r.session.id === 's-manual'),
     'a manual scheduled session is never awaiting confirmation');
-  assert.ok(!wf.awaiting.some((r) => r.event.id === 'e-no-end'),
-    'an appointment with no usable end time is never confirmable');
+  assert.ok(!wf.awaiting.some((r) => r.event.id === 'e-future'),
+    'a future appointment is never confirmable');
+
+  //    The count IS the classifier's bucket length — not a parallel rule.
+  assert.strictEqual(
+    cardValue(cardByLabel(root, 'Sessions to confirm')), String(wf.awaiting.length),
+    'the Dashboard count and the Calendar tab can never disagree');
 
   // 4. Claims needing correction is needs_correction and nothing else.
   assert.strictEqual(cardValue(cardByLabel(root, 'Claims needing correction')), '1',
