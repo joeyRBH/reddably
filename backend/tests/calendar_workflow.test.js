@@ -19,8 +19,12 @@
 //     the intersection of confirmed calendar events carrying a session_id and
 //     sessions still in 'scheduled'. A manually created scheduled session has no
 //     calendar event and must never appear;
-//   * a missing or unparseable ends_at can NEVER make a session confirmable
-//     (session_date is not consulted at all);
+//   * the end-time fallback is SYMMETRIC across the two loops — ends_at when
+//     usable, starts_at otherwise — so an all-day appointment (ends_at null)
+//     travels needs-a-client -> awaiting -> gone instead of leaving `matching`
+//     on promotion and landing in no bucket at all (session_date is still never
+//     consulted, and an event with no usable time at ALL is still never
+//     confirmable);
 //   * past work sorts ends_at DESC, upcoming appointments sort starts_at ASC —
 //     two deliberately different orders, not one global sort;
 //   * unpromoted past appointments stay visible for matching, and ignored
@@ -96,11 +100,24 @@ const E_ENDED_OLDER = ev('e-ended-older', {
   match_state: 'confirmed', session_id: 's-older', matched_client_name: 'Client B',
   starts_at: T('2026-07-27T14:00:00Z'), ends_at: T('2026-07-27T15:00:00Z'),
 });
-// Promoted, ended, but no end time at all (an all-day appointment) — the
-// session exists, yet it must never become confirmable from here.
+// Promoted, past, but no end time at all (an all-day appointment). It is placed
+// by its START — the same fallback the unpromoted loop uses — so it reaches
+// confirmation instead of vanishing out of every bucket on promotion.
 const E_ENDED_NO_END = ev('e-ended-no-end', {
   match_state: 'confirmed', session_id: 's-no-end',
   starts_at: T('2026-07-26T00:00:00Z'), ends_at: null,
+});
+// Promoted, no end time, and its start is still ahead -> upcoming, never
+// confirmable early.
+const E_FUTURE_PROMOTED_NO_END = ev('e-future-promoted-no-end', {
+  match_state: 'confirmed', session_id: 's-future-no-end',
+  starts_at: T('2026-08-02T00:00:00Z'), ends_at: null,
+});
+// Promoted with NO usable time of any kind: unplaceable, so it stays out of
+// every bucket rather than being guessed into one.
+const E_NO_TIMES = ev('e-no-times', {
+  match_state: 'confirmed', session_id: 's-no-times',
+  starts_at: null, ends_at: null,
 });
 // Promoted, ended, but its session already advanced past 'scheduled'.
 const E_ALREADY_CONFIRMED = ev('e-already-confirmed', {
@@ -155,13 +172,16 @@ const DATA = {
   pending: [E_PAST_UNMATCHED, E_PAST_SUGGESTED, E_PAST_BAD_END, E_FUTURE_UNMATCHED, E_FUTURE_ALL_DAY],
   confirmed: [
     E_ENDED_RECENT, E_ENDED_OLDER, E_ENDED_NO_END, E_ALREADY_CONFIRMED,
-    E_FUTURE_PROMOTED, E_IN_PROGRESS, E_CANCELLED,
+    E_FUTURE_PROMOTED, E_FUTURE_PROMOTED_NO_END, E_NO_TIMES, E_IN_PROGRESS,
+    E_CANCELLED,
   ],
   ignored: [E_IGNORED],
   sessions: [
     session('s-recent', 'scheduled'),
     session('s-older', 'scheduled'),
     session('s-no-end', 'scheduled'),
+    session('s-future-no-end', 'scheduled'),
+    session('s-no-times', 'scheduled'),
     session('s-future', 'scheduled'),
     session('s-in-progress', 'scheduled'),
     session('s-cancelled', 'scheduled'),
@@ -176,10 +196,12 @@ const ids = (rows) => rows.map((r) => r.event.id);
 
 // --- 1. awaiting confirmation is the intersection of the two resources -------
 
-assert.deepStrictEqual(ids(wf.awaiting), ['e-ended-recent', 'e-ended-older'],
+assert.deepStrictEqual(ids(wf.awaiting),
+  ['e-ended-recent', 'e-ended-older', 'e-ended-no-end'],
   'awaiting = confirmed events with a session_id, joined to still-scheduled sessions');
 assert.strictEqual(wf.awaiting[0].session.id, 's-recent');
 assert.strictEqual(wf.awaiting[1].session.id, 's-older');
+assert.strictEqual(wf.awaiting[2].session.id, 's-no-end');
 wf.awaiting.forEach((row) => {
   assert.strictEqual(row.event.session_id, row.session.id, 'the row joins on session_id');
   assert.strictEqual(row.session.status, 'scheduled');
@@ -201,26 +223,54 @@ assert.strictEqual(
   'the manual session appears in no section at all'
 );
 
-// --- 3. missing / invalid ends_at can never become confirmable ---------------
+// --- 3. the end-time fallback is symmetric across both loops -----------------
 
-assert.ok(!ids(wf.awaiting).includes('e-ended-no-end'),
-  'no end time -> not confirmable, even though the session is scheduled');
-assert.ok(!ids(wf.awaiting).includes('e-past-bad-end'),
-  'an unparseable end time -> not confirmable');
-wf.awaiting.forEach((row) => {
-  assert.strictEqual(typeof row.endMs, 'number');
-  assert.ok(row.endMs <= NOW, 'every awaiting row has a valid end time already past');
+// An all-day appointment (ends_at null) is placed by its START in BOTH loops.
+// Promoted and past, that makes it confirmable rather than invisible: before
+// this fallback it left `matching` on promotion and landed in no bucket at all,
+// stranding its session in 'scheduled' forever.
+assert.ok(ids(wf.awaiting).includes('e-ended-no-end'),
+  'a promoted, past all-day appointment reaches confirmation');
+assert.strictEqual(wf.awaiting.filter((r) => r.event.id === 'e-ended-no-end')[0].endMs, null,
+  'it gets there on its start time — endMs really is null');
+
+// The fallback places by start; it does not make everything confirmable.
+assert.ok(ids(wf.upcoming).includes('e-future-promoted-no-end'),
+  'an all-day appointment whose start is still ahead stays upcoming');
+assert.ok(!ids(wf.awaiting).includes('e-future-promoted-no-end'),
+  'a future all-day appointment is never confirmable early');
+
+// No usable time of any kind -> unplaceable, so it is guessed into no bucket.
+[wf.awaiting, wf.matching, wf.upcoming, wf.ignored].forEach((bucket) => {
+  assert.ok(!ids(bucket).includes('e-no-times'),
+    'an event with neither start nor end appears nowhere');
 });
 
-// A past appointment with no usable end time still has to be reachable for
-// matching rather than silently disappearing.
+// session_date is still never consulted to decide confirmability. Comments
+// discuss it, so strip block AND line comments before checking the code.
+assert.ok(!/session_date/.test(
+  workflowSrc.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+), 'the classifier never reads session_date');
+
+// Every awaiting row is genuinely past by whichever time placed it.
+wf.awaiting.forEach((row) => {
+  const effective = row.endMs === null ? row.startMs : row.endMs;
+  assert.strictEqual(typeof effective, 'number');
+  assert.ok(effective <= NOW, 'every awaiting row is already past');
+});
+
+// An unpromoted past appointment with a bad end time is unchanged: still
+// reachable for matching rather than silently disappearing, still not awaiting.
+assert.ok(!ids(wf.awaiting).includes('e-past-bad-end'),
+  'an unpromoted event is never awaiting, whatever its end time');
 assert.ok(ids(wf.matching).includes('e-past-bad-end'),
   'an unmatched past appointment with a bad end time stays visible for matching');
 
 // --- 4. past work sorts ends_at DESC -----------------------------------------
 
-assert.deepStrictEqual(ids(wf.awaiting), ['e-ended-recent', 'e-ended-older'],
-  'most recently ended session first');
+assert.deepStrictEqual(ids(wf.awaiting),
+  ['e-ended-recent', 'e-ended-older', 'e-ended-no-end'],
+  'most recently ended session first; an unusable end time sorts last');
 assert.deepStrictEqual(
   ids(wf.matching),
   ['e-past-unmatched', 'e-past-suggested', 'e-past-bad-end'],
@@ -231,7 +281,8 @@ assert.deepStrictEqual(
 
 assert.deepStrictEqual(
   ids(wf.upcoming),
-  ['e-in-progress', 'e-future-unmatched', 'e-future-promoted', 'e-future-all-day'],
+  ['e-in-progress', 'e-future-unmatched', 'e-future-promoted', 'e-future-all-day',
+   'e-future-promoted-no-end'],
   'soonest upcoming appointment first'
 );
 // Explicitly NOT one global sort: the two sections order opposite ways.
@@ -343,19 +394,26 @@ assert.ok(iViews !== -1 && iViews < iWorkflow,
 assert.ok(iWorkflow < iDashboard && iWorkflow < iCalendar,
   'workflow.js loads before both the Dashboard and Calendar views');
 
-// Exactly the three intended assets move; Claims and the rest stay put.
-const VERSION = '20260728c';
-['./workflow.js', './views/dashboard.js', './views/calendar.js'].forEach((asset) => {
+// This change edits workflow.js and nothing else, so exactly ONE asset moves.
+// The views are untouched source and keep the cache-buster they shipped with —
+// re-bumping them would evict warm caches for no reason.
+const VERSION = '20260810a';
+const bustOf = (asset) => {
   const m = appHtml.match(new RegExp(asset.replace(/[.\/]/g, '\\$&') + '\\?v=([^"\']+)'));
   assert.ok(m, 'app.html loads ' + asset);
-  assert.strictEqual(m[1], VERSION, asset + ' carries the PR cache-buster');
-});
-const claimsBust = appHtml.match(/\.\/views\/claims\.js\?v=([^"']+)/);
-assert.strictEqual(claimsBust && claimsBust[1], '20260728b',
-  'the Claims cache-buster is untouched by this change');
+  return m[1];
+};
+assert.strictEqual(bustOf('./workflow.js'), VERSION,
+  'the edited classifier carries the new cache-buster');
 assert.strictEqual(
-  (appHtml.match(new RegExp('\\?v=' + VERSION, 'g')) || []).length, 3,
-  'exactly three assets carry the new cache-buster'
+  (appHtml.match(new RegExp('\\?v=' + VERSION, 'g')) || []).length, 1,
+  'exactly one asset carries the new cache-buster'
 );
+assert.strictEqual(bustOf('./views/dashboard.js'), '20260728c',
+  'the Dashboard cache-buster is untouched — its source did not change');
+assert.strictEqual(bustOf('./views/calendar.js'), '20260728c',
+  'the Calendar cache-buster is untouched — its source did not change');
+assert.strictEqual(bustOf('./views/claims.js'), '20260728b',
+  'the Claims cache-buster is untouched by this change');
 
 console.log('PASS calendar_workflow.test.js');

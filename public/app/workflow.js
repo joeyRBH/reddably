@@ -39,8 +39,7 @@
   //
   // Rules that matter:
   //   * awaiting  = confirmed event WITH session_id  ∩  still-'scheduled' session
-  //     of that id, whose ends_at is valid AND already past. Missing/invalid
-  //     ends_at never makes a session confirmable, and session_date is never
+  //     of that id, whose effective end is already past. session_date is never
   //     used to decide it.
   //   * upcoming  = non-ignored, non-cancelled events whose end is still ahead.
   //   * matching  = unpromoted events that have ended (or that carry no end time
@@ -50,8 +49,18 @@
   //   * Ordering is intentionally split: past work newest-first (ends_at DESC),
   //     upcoming soonest-first (starts_at ASC).
   //
-  // A promoted all-day appointment (no end time) is not confirmable from here;
-  // its session is completed from the client chart instead.
+  // "Effective end" is ends_at when usable and starts_at otherwise, applied
+  // identically in BOTH loops. That symmetry is the whole point: an all-day
+  // appointment (ends_at null) is placed by its start whether or not it has been
+  // promoted, so it stays in exactly one bucket through the pipeline
+  //
+  //   needs a client -> (match) -> awaiting confirmation -> (confirm) -> gone
+  //
+  // rather than leaving `matching` on promotion and landing in no bucket at all.
+  // The consequence for an all-day appointment is that it becomes confirmable at
+  // the start of its own day; confirming is a deliberate human action, so an
+  // early offer costs nothing, while the previous silent disappearance stranded
+  // the session in 'scheduled' forever.
   //
   // Callers that only need `awaiting` (the Dashboard) may omit data.ignored —
   // an absent bucket is an empty one, never an error.
@@ -78,11 +87,10 @@
     // ended and waiting on the clinician's confirmation.
     confirmed.filter(live).forEach(function (ev) {
       var row = item(ev, null);
-      if (row.endMs === null) {
-        if (row.startMs !== null && row.startMs > nowMs) upcoming.push(row);
-        return;
-      }
-      if (row.endMs > nowMs) {
+      // The same end-time fallback the pending loop applies below.
+      var effectiveEnd = row.endMs === null ? row.startMs : row.endMs;
+      if (effectiveEnd === null) return;
+      if (effectiveEnd > nowMs) {
         upcoming.push(row);
         return;
       }
