@@ -8,7 +8,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test backend/tests/*.test.js"
+    "test": "node backend/scripts/run-tests.js"
   },
   "dependencies": {
     "jsonwebtoken": "^9.0.2",

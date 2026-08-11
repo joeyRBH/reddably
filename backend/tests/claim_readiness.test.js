@@ -61,6 +61,11 @@ const handlerSource = fs.readFileSync(
   'ageInYears',
   'evaluateSubmissionWarnings',
   'missingInsuranceRecord',
+  'missingBilledAmount',
+  'missingSessionCptCode',
+  'missingDiagnosisCodes',
+  'excessDiagnosisCodes',
+  'missingPayerId',
 ].forEach((name) => {
   assert.ok(
     !new RegExp(`function\\s+${name}\\s*\\(`).test(handlerSource),
@@ -84,6 +89,18 @@ assert.ok(
   !/Attach an insurance record before submitting/.test(handlerSource),
   'the missing-insurance wording lives only in the shared module'
 );
+[
+  'This claim has no billed amount',
+  'This claim has no CPT/procedure code',
+  'This claim has no diagnosis code',
+  'at most 12 diagnosis codes',
+  'no routable payer ID',
+].forEach((fragment) => {
+  assert.ok(
+    handlerSource.indexOf(fragment) === -1,
+    `the content-blocker wording "${fragment}" lives only in the shared module`
+  );
+});
 
 // ===========================================================================
 // Part B — the pure evaluator
@@ -91,9 +108,11 @@ assert.ok(
 
 const OK_PRACTICE = { address_line1: '1 Main St', city: 'Denver', state: 'CO', postal_code: '80202' };
 const OK_CLIENT = { date_of_birth: PATIENT_DOB };
-const OK_SESSION = { place_of_service: '10' };
-const OK_INSURANCE = { subscriber_relationship: 'self', member_id: 'W123456789' };
-const OK_CLAIM = { insurance_record_id: 'i1' };
+// A submittable claim needs billable CONTENT as well as setup: a charge, a
+// procedure code, at least one diagnosis, and a payer id to route it.
+const OK_SESSION = { place_of_service: '10', cpt_code: '90837', diagnosis_codes: ['F411'] };
+const OK_INSURANCE = { subscriber_relationship: 'self', member_id: 'W123456789', payer_id: '60054' };
+const OK_CLAIM = { insurance_record_id: 'i1', billed_amount: '150.00' };
 
 function ctx(over) {
   return Object.assign({
@@ -112,7 +131,7 @@ assert.ok(readiness.READINESS_STATES.indexOf('ready_to_submit') === -1,
 
 // 2. A soft warning alone -> review_warning, and the claim is NOT blocked.
 r = readiness.evaluateClaimReadiness(ctx({
-  insurance: { subscriber_relationship: 'self', member_id: 'AB' },
+  insurance: { subscriber_relationship: 'self', member_id: 'AB', payer_id: '60054' },
 }));
 assert.strictEqual(r.state, 'review_warning');
 assert.deepStrictEqual(r.blockers, []);
@@ -123,13 +142,14 @@ r = readiness.evaluateClaimReadiness(ctx({ client: { date_of_birth: null } }));
 assert.strictEqual(r.state, 'needs_correction');
 assert.deepStrictEqual(r.blockers.map((b) => b.code), ['client_date_of_birth']);
 
-// 4. Blockers come back in submit's order, with submit's status codes.
+// 4. Blockers come back in submit's order, with submit's status codes. The
+//    billable-content blockers follow the setup/demographic ones.
 r = readiness.evaluateClaimReadiness({
-  claim: { insurance_record_id: null },
+  claim: { insurance_record_id: null, billed_amount: null },
   practice: {},
   client: {},
-  insurance: { subscriber_relationship: 'child', subscriber_name: '', subscriber_dob: null },
-  session: { place_of_service: 'office' },
+  insurance: { subscriber_relationship: 'child', subscriber_name: '', subscriber_dob: null, payer_id: null },
+  session: { place_of_service: 'office', cpt_code: null, diagnosis_codes: null },
 });
 assert.deepStrictEqual(r.blockers.map((b) => b.code), [
   'missing_insurance_record',
@@ -137,14 +157,21 @@ assert.deepStrictEqual(r.blockers.map((b) => b.code), [
   'client_date_of_birth',
   'dependent_policyholder',
   'session_place_of_service',
+  'claim_billed_amount',
+  'session_cpt_code',
+  'claim_diagnosis_codes',
+  'insurance_payer_id',
 ], 'projection emits blockers in the submit gate order');
-assert.deepStrictEqual(r.blockers.map((b) => b.status), [400, 422, 422, 422, 422],
-  'missing insurance answers 400; the context blockers answer 422');
+assert.deepStrictEqual(r.blockers.map((b) => b.status), [400, 422, 422, 422, 422, 422, 422, 422, 422],
+  'missing insurance answers 400; the context and content blockers answer 422');
 
 // 5. A replacement is a review warning here — its DB-dependent gates stay
 //    submit-time and are deliberately not duplicated in the projection.
 r = readiness.evaluateClaimReadiness(ctx({
-  claim: { insurance_record_id: 'i1', submission_frequency_code: '7', corrects_claim_id: 'x' },
+  claim: {
+    insurance_record_id: 'i1', billed_amount: '150.00',
+    submission_frequency_code: '7', corrects_claim_id: 'x',
+  },
 }));
 assert.strictEqual(r.state, 'review_warning');
 assert.deepStrictEqual(r.warnings.map((w) => w.code), ['replacement_claim']);
@@ -170,6 +197,71 @@ assert.deepStrictEqual(warned, [
   { code: 'dependent_missing_policyholder_name', message: 'Dependent claim has no policyholder name.' },
   { code: 'member_id_length_unusual', message: 'Member ID length looks unusual.' },
 ], 'warning codes and messages are byte-for-byte unchanged');
+
+// 8. Billable CONTENT blockers — each one alone makes an otherwise complete
+//    claim needs_correction, with its exact message. A claim missing these is
+//    rejected by the clearinghouse (or, for the payer id and the diagnosis
+//    limit, cannot even be BUILT), so they are hard blockers, never warnings.
+const CONTENT_CASES = [
+  ['claim_billed_amount', { claim: { insurance_record_id: 'i1', billed_amount: null } },
+    'This claim has no billed amount — set the session rate and use Edit claim → Save & regenerate.'],
+  ['claim_billed_amount', { claim: { insurance_record_id: 'i1', billed_amount: '0.00' } }, null],
+  ['claim_billed_amount', { claim: { insurance_record_id: 'i1', billed_amount: '-5.00' } }, null],
+  ['session_cpt_code', { session: { place_of_service: '10', cpt_code: '  ', diagnosis_codes: ['F411'] } },
+    'This claim has no CPT/procedure code — add it on the session.'],
+  ['claim_diagnosis_codes', { session: { place_of_service: '10', cpt_code: '90837', diagnosis_codes: [] } },
+    'This claim has no diagnosis code — add at least one on the session.'],
+  ['claim_diagnosis_codes', { session: { place_of_service: '10', cpt_code: '90837', diagnosis_codes: null } }, null],
+  // Blank / punctuation-only codes normalize away to nothing, exactly as they
+  // would on the wire — so they are "no diagnosis", not a diagnosis.
+  ['claim_diagnosis_codes', { session: { place_of_service: '10', cpt_code: '90837', diagnosis_codes: ['', '.'] } }, null],
+  ['claim_diagnosis_limit', {
+    session: {
+      place_of_service: '10', cpt_code: '90837',
+      diagnosis_codes: ['F32.0', 'F32.1', 'F32.2', 'F33.0', 'F33.1', 'F33.2', 'F40.0',
+        'F41.0', 'F41.1', 'F42.2', 'F43.1', 'F43.2', 'F50.0'],
+    },
+  }, 'A claim can carry at most 12 diagnosis codes.'],
+  ['insurance_payer_id', { insurance: { subscriber_relationship: 'self', member_id: 'W123456789', payer_id: null } },
+    "This client's insurance has no routable payer ID — re-run intake or set the payer on the insurance record."],
+  ['insurance_payer_id', { insurance: { subscriber_relationship: 'self', member_id: 'W123456789', payer_id: '   ' } }, null],
+];
+CONTENT_CASES.forEach(([code, over, message]) => {
+  const got = readiness.evaluateClaimReadiness(ctx(over));
+  assert.strictEqual(got.state, 'needs_correction', `${code}: ${JSON.stringify(over)} blocks`);
+  assert.deepStrictEqual(got.blockers.map((b) => b.code), [code],
+    `${code} is the only blocker for ${JSON.stringify(over)}`);
+  assert.strictEqual(got.blockers[0].status, 422);
+  if (message) assert.strictEqual(got.blockers[0].message, message, `${code} wording`);
+});
+
+// Exactly 12 diagnoses is the LIMIT, not one over it, and duplicates/format
+// collapse before counting — the same normalization the wire builder applies.
+assert.strictEqual(readiness.MAX_CLAIM_DIAGNOSES, 12);
+const TWELVE = ['F32.0', 'F32.1', 'F32.2', 'F33.0', 'F33.1', 'F33.2',
+  'F40.0', 'F41.0', 'F41.1', 'F42.2', 'F43.1', 'F43.2'];
+r = readiness.evaluateClaimReadiness(ctx({
+  session: { place_of_service: '10', cpt_code: '90837', diagnosis_codes: TWELVE },
+}));
+assert.strictEqual(r.state, 'ready_to_review', 'twelve diagnoses is within the 837P limit');
+r = readiness.evaluateClaimReadiness(ctx({
+  session: { place_of_service: '10', cpt_code: '90837', diagnosis_codes: TWELVE.concat(['f43.2', 'F4 3 2']) },
+}));
+assert.strictEqual(r.state, 'ready_to_review',
+  'duplicates collapse before the limit is applied, as they do on the wire');
+
+// A NULL insurance context is missingInsuranceRecord's case, not the payer id's —
+// on the list projection that is also how a HIDDEN record presents, and the
+// projection has always treated a hidden record as absent.
+assert.strictEqual(readiness.missingPayerId(null), false);
+
+// A positive charge in any of the shapes pg / the API hand us is submittable.
+['150.00', 150, '0.01'].forEach((v) => {
+  assert.strictEqual(readiness.missingBilledAmount({ billed_amount: v }), false, `billed_amount ${v} is fine`);
+});
+[null, undefined, '', '   ', 0, '0', '0.00', -1, 'abc'].forEach((v) => {
+  assert.strictEqual(readiness.missingBilledAmount({ billed_amount: v }), true, `billed_amount ${v} blocks`);
+});
 
 // ===========================================================================
 // Part C + D — the handler, against a mocked database
@@ -320,11 +412,13 @@ function resetSubmitFixtures() {
   state.claim = freshDraft();
   fixtures.practices = { ...fixtures.practices, ...OK_PRACTICE };
   fixtures.clients = { ...fixtures.clients, date_of_birth: PATIENT_DOB };
-  fixtures.sessions = { ...fixtures.sessions, place_of_service: '10' };
+  fixtures.sessions = {
+    ...fixtures.sessions, place_of_service: '10', cpt_code: '90837', diagnosis_codes: ['F411'],
+  };
   fixtures.insurance_records = {
     ...fixtures.insurance_records, is_hidden: false,
     subscriber_relationship: 'self', subscriber_name: null, subscriber_dob: null,
-    member_id: 'W123456789',
+    member_id: 'W123456789', payer_id: '60054',
   };
   adapterState.submitCalls = 0;
   sqlLog.length = 0;
@@ -404,6 +498,69 @@ function assertNoMutationOrTransmission(label) {
     '02 (Telehealth (patient not in their home)), 10 (Telehealth (patient in their home)), ' +
     '11 (Office), 12 (Home), 49 (Independent clinic), 53 (Community mental health center).');
   assertNoMutationOrTransmission('place of service');
+
+  // --- C2b. Billable CONTENT blockers: each answers 422 with its exact message,
+  //          leaves the claim a DRAFT, and transmits nothing. `confirmed: true`
+  //          does not get past them — these are blockers, not warnings.
+  //
+  //          The last two matter most: a missing payer id and an over-limit
+  //          diagnosis list make the adapter throw while BUILDING the body, which
+  //          happens after the status='submitted' transaction — so without this
+  //          gate the claim strands in a retry-blocked state having transmitted
+  //          nothing. Asserting status 'draft' here IS that regression test.
+  const contentBlockerCases = [
+    ['no billed amount', () => { state.claim = { ...freshDraft(), billed_amount: null }; },
+      'This claim has no billed amount — set the session rate and use Edit claim → Save & regenerate.'],
+    ['zero billed amount', () => { state.claim = { ...freshDraft(), billed_amount: '0.00' }; },
+      'This claim has no billed amount — set the session rate and use Edit claim → Save & regenerate.'],
+    ['no CPT code', () => { fixtures.sessions = { ...fixtures.sessions, cpt_code: null }; },
+      'This claim has no CPT/procedure code — add it on the session.'],
+    ['no diagnosis', () => { fixtures.sessions = { ...fixtures.sessions, diagnosis_codes: [] }; },
+      'This claim has no diagnosis code — add at least one on the session.'],
+    ['too many diagnoses', () => {
+      fixtures.sessions = {
+        ...fixtures.sessions,
+        diagnosis_codes: ['F320', 'F321', 'F322', 'F330', 'F331', 'F332', 'F400',
+          'F410', 'F411', 'F422', 'F431', 'F432', 'F500'],
+      };
+    }, 'A claim can carry at most 12 diagnosis codes.'],
+    ['no payer id', () => { fixtures.insurance_records = { ...fixtures.insurance_records, payer_id: null }; },
+      "This client's insurance has no routable payer ID — re-run intake or set the payer on the insurance record."],
+  ];
+  for (const [label, breakIt, message] of contentBlockerCases) {
+    resetSubmitFixtures();
+    breakIt();
+    res = await claims.handler(submitEvent({ confirmed: true }));
+    bodies.push(['content blocker: ' + label, res.statusCode, res.body]);
+    assert.strictEqual(res.statusCode, 422, label + ': answers 422');
+    assert.strictEqual(parse(res).error, message, label + ': exact message');
+    // Not a hold-for-confirmation, and not a stranded submission.
+    assert.ok(!('requires_confirmation' in parse(res)), label + ': a blocker, not a warning');
+    assert.strictEqual(state.claim.status, 'draft', label + ': the claim is STILL a draft');
+    assertNoMutationOrTransmission(label);
+  }
+
+  // A claim that is complete in every respect still submits — the new blockers
+  // gate broken claims only.
+  resetSubmitFixtures();
+  res = await claims.handler(submitEvent({ confirmed: true }));
+  bodies.push(['content complete: happy path', res.statusCode, res.body]);
+  assert.strictEqual(res.statusCode, 200, 'a complete claim still submits');
+  assert.strictEqual(parse(res).claim.status, 'submitted');
+  assert.strictEqual(state.claim.status, 'submitted');
+  assert.strictEqual(adapterState.submitCalls, 1, 'the happy path transmits exactly once');
+
+  // Exactly twelve diagnoses is within the 837P limit and still submits.
+  resetSubmitFixtures();
+  fixtures.sessions = {
+    ...fixtures.sessions,
+    diagnosis_codes: ['F320', 'F321', 'F322', 'F330', 'F331', 'F332',
+      'F400', 'F410', 'F411', 'F422', 'F431', 'F432'],
+  };
+  res = await claims.handler(submitEvent({ confirmed: true }));
+  bodies.push(['twelve diagnoses submits', res.statusCode, res.body]);
+  assert.strictEqual(res.statusCode, 200, 'twelve diagnoses is the limit, not over it');
+  assert.strictEqual(adapterState.submitCalls, 1);
 
   // --- C3. Soft warnings stay advisory: held without confirmed, sent with it --
   resetSubmitFixtures();
@@ -582,6 +739,30 @@ function assertNoMutationOrTransmission(label) {
   const hidden = parse(res).claims[0];
   assert.strictEqual(hidden.readiness.state, 'ready_to_review',
     'a hidden insurance record is invisible to the projection, as it is to submit');
+
+  // 12b. The content blockers feed the projection too, so the list flags a claim
+  //      as "needs correction" BEFORE anyone clicks submit — the whole point of
+  //      the projection being a composition of the gate rather than a copy.
+  state.listRows = [
+    listRow({ id: 'd-no-amount', billed_amount: null }),
+    listRow({ id: 'd-no-cpt', session_cpt_code: null }),
+    listRow({ id: 'd-no-dx', session_diagnosis_codes: [] }),
+    listRow({ id: 'd-no-payer', payer_id: null }),
+  ];
+  res = await claims3.handler(listEvent(null));
+  const contentRows = {};
+  parse(res).claims.forEach((row) => { contentRows[row.id] = row; });
+  [
+    ['d-no-amount', 'claim_billed_amount'],
+    ['d-no-cpt', 'session_cpt_code'],
+    ['d-no-dx', 'claim_diagnosis_codes'],
+    ['d-no-payer', 'insurance_payer_id'],
+  ].forEach(([id, code]) => {
+    assert.strictEqual(contentRows[id].readiness.state, 'needs_correction', id + ' needs correction');
+    assert.deepStrictEqual(contentRows[id].readiness.blockers.map((b) => b.code), [code],
+      id + ' surfaces exactly the ' + code + ' blocker');
+    assert.strictEqual(contentRows[id].readiness.blockers[0].status, 422);
+  });
 
   // 13. Existing filters still behave.
   state.listRows = [paidRow];

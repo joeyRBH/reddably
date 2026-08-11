@@ -161,6 +161,31 @@ only to attach claims to). Those belong to Sessionably.
 - One PR per logical unit of work. Do NOT merge — the user reviews and merges.
 - Never commit secrets; respect `.gitignore` (`.env*` etc.). Only `.env.example` is tracked.
 
+## Before opening a PR
+
+Verification happens BEFORE the commit, not after the PR. All three steps below are
+required; there is no "commit it and check CI".
+
+1. **`npm test` must be green.** One command runs the entire backend suite
+   (`backend/scripts/run-tests.js` → every `backend/tests/*.test.js`, each in its own
+   process) and exits non-zero if any file fails. Run the whole suite, not just the file
+   you touched — the suite is ~5 seconds. `npm test -- <substring>` narrows it while
+   debugging, but the full run is what gates the commit.
+2. **Curl-check every API endpoint you touched.** A green unit test proves the handler
+   logic; it does not prove the deployed route, its auth, or its response shape. For any
+   endpoint added or changed, hit it with `curl` (against the deployed Lambda, or locally)
+   and paste the actual request/response into the PR body. Never send real PHI in a
+   self-check — use synthetic fixtures.
+3. **If anything fails, stay in debug and do NOT commit.** A failing test or a curl that
+   answers wrong is the task, not a footnote. Do not commit a red suite, do not commit
+   with a "fix in a follow-up" note, and do not weaken or skip an assertion to get to
+   green. If a test is genuinely wrong, fix the test deliberately and say so in the PR
+   body.
+
+Add or extend a test for the behavior you changed. `backend/tests/onboarding_to_claim_e2e.test.js`
+walks the critical path (client → intake → clinician confirm → session → claim → submit)
+end to end; if a change touches that chain, it belongs there.
+
 ## More context
 
 @README.md @db/schema.sql
