@@ -31,21 +31,24 @@
 //
 // Fixtures are synthetic ids and placeholder names — no PHI.
 //
-// ON THE NEGATIVE HALF (part B): the four billable facts (billed amount, CPT,
-// diagnosis, payer id) are NOT all hard-blocked at submit, and this test pins
-// what the code really does rather than what would be nice:
+// ON THE NEGATIVE HALF (part B): what stops a claim before it is transmitted,
+// pinned as what the code really does rather than what would be nice:
 //
 //   * client date of birth, practice billing address, and an invalid place of
 //     service ARE hard blockers — 422, claim stays draft, adapter never called;
 //   * a claim with no insurance record attached is a 400 (it predates the 422
 //     blockers), claim stays draft, adapter never called;
-//   * a missing PAYER ID is caught by the clearinghouse adapter, not the gate:
-//     submit reaches the adapter, which refuses to build the 837P. The handler
-//     answers 502 "outcome unknown" and the claim is deliberately left
-//     'submitted' with no control number, awaiting reconciliation;
-//   * a missing BILLED AMOUNT, CPT CODE, or DIAGNOSIS is not blocked anywhere —
-//     the claim transmits. That is a real gap, asserted here so that closing it
-//     is a deliberate change with a failing test to update, not a surprise.
+//   * the billable CONTENT — billed amount, CPT code, diagnosis, and the payer id
+//     that routes the claim — is likewise hard-blocked with a 422 while the claim
+//     is still a draft. Two of those matter more than the rest: a missing payer id
+//     and an over-limit diagnosis list make the adapter throw while BUILDING the
+//     837P, which happens after submit has already moved the claim to 'submitted',
+//     so before they were blocked a never-transmitted claim stranded in a
+//     retry-blocked 502. The adapter's own refusals remain as a backstop for
+//     direct callers, asserted here against the real builder.
+//
+// The content blockers check those facts are PRESENT, never that they are RIGHT —
+// a human still verifies that, which is why the clear state is ready_to_REVIEW.
 //
 //   node backend/tests/onboarding_to_claim_e2e.test.js
 
@@ -784,7 +787,13 @@ test('readiness projection refuses the same claims the gate refuses', async () =
   }
 });
 
-test('missing payer id is caught by the adapter, not the gate — 502, claim held for reconcile', async () => {
+test('missing payer id is blocked by the gate — 422, claim stays draft', async () => {
+  // This case USED to reach the adapter: the gate said nothing about the payer
+  // id, so submit moved the claim to 'submitted' and only then failed building
+  // the 837P — stranding a never-transmitted claim in a retry-blocked 502. The
+  // content blockers close that off ahead of the status transition, so the claim
+  // never leaves draft. adapter.mode stays 'build_error' to prove the point: even
+  // primed to fail, the adapter is never reached.
   resetStore();
   adapter.calls.length = 0;
   adapter.mode = 'build_error';
@@ -793,26 +802,33 @@ test('missing payer id is caught by the adapter, not the gate — 502, claim hel
   const ids = await runChain({ payerId: null });
   assert.strictEqual(store.insurance_records[0].payer_id, null, 'coverage saved without a payer id');
 
-  // Nothing upstream blocks it: the projection still reads ready_to_review,
-  // because payer id is one of the facts a HUMAN verifies (ready_to_REVIEW).
+  // The projection flags it before anyone clicks submit, naming the status submit
+  // would answer.
   const row = body(await listClaims()).claims.find((r) => r.id === ids.claim.id);
-  assert.strictEqual(row.readiness.state, 'ready_to_review', 'no modeled blocker objects');
-  assert.strictEqual(row.payer_id, null, 'though the row shows the payer id is missing');
+  assert.strictEqual(row.readiness.state, 'needs_correction', 'a modeled blocker objects');
+  assert.strictEqual(row.payer_id, null, 'and the row shows the payer id is missing');
+  const payerBlocker = row.readiness.blockers.find((b) => b.code === 'insurance_payer_id');
+  assert.ok(payerBlocker, 'the blocker names the payer id');
+  assert.strictEqual(payerBlocker.status, 422, 'reporting the status submit would answer');
 
   const res = await submitClaim(ids.claim.id);
-  assert.strictEqual(adapter.calls.length, 1, 'submit reached the adapter');
-  assert.strictEqual(res.statusCode, 502, 'an unbuildable 837P is an UNKNOWN outcome, not a 422');
-  assert.match(body(res).error, /did not confirm this submission/);
-  assert.strictEqual(body(res).outcome, 'unknown');
+  assert.strictEqual(res.statusCode, 422, 'submit is refused with 422');
+  assert.match(body(res).error, /no routable payer ID/, 'and says which field to fix');
+  assert.strictEqual(adapter.calls.length, 0, 'the clearinghouse was never called');
 
-  // Deliberately NOT returned to draft: the handler cannot know the clearinghouse
-  // never saw it, so the claim is held in the state that blocks a retry.
   const after = claimRow(ids.claim.id);
-  assert.strictEqual(after.status, 'submitted', 'the claim is held as submitted');
-  assert.strictEqual(after.control_number, null, 'with no control number = outcome unknown');
+  assert.strictEqual(after.status, 'draft', 'the claim stays draft');
+  assert.strictEqual(after.submitted_at, null, 'and was never marked submitted');
+  assert.strictEqual(after.control_number, null, 'and has no control number');
+  // The 422 blockers run AFTER the patient control number is minted, so a blocked
+  // submit does leave that one field written. Harmless and deliberate: the PCN is a
+  // stable per-claim id, minted with a coalesce and reused by every later
+  // submission of this claim, so the eventual real submit carries the same value.
+  // (The 400 "no insurance attached" case above predates minting and leaves it null.)
+  assert.ok(after.patient_control_number, 'the control number minted before the gate is kept');
 
-  // The refusal itself is the real adapter's, asserted against the real builder
-  // rather than the stub above.
+  // The adapter's own refusal survives as a BACKSTOP for direct callers — normal
+  // flow no longer reaches it, but it must still refuse a payer-less claim.
   assert.throws(
     () => stedi.buildSubmissionBody({
       claim: { billed_amount: '150.00', patient_control_number: 'PCN1' },
@@ -820,14 +836,15 @@ test('missing payer id is caught by the adapter, not the gate — 502, claim hel
       client: {}, clinician: {}, practice: {}, session: {},
     }),
     /requires insurance\.payer_id/,
-    'the 837P builder is what refuses a payer-less claim'
+    'the 837P builder still refuses a payer-less claim'
   );
 });
 
-test('KNOWN GAP: a claim with no billed amount, CPT, or diagnosis still transmits', async () => {
-  // Not an endorsement — a pin. Nothing in the submit gate or the readiness
-  // projection blocks these three, so a claim missing all of them reaches the
-  // clearinghouse. When that is closed, this test is the one to update.
+test('blocked 422 and stays draft — no billed amount, CPT, or diagnosis', async () => {
+  // The billable content the claim actually charges for. A claim missing all
+  // three once transmitted: it billed nothing, carried no procedure code, and
+  // would have gone out with a fabricated placeholder diagnosis. All three are
+  // hard blockers now, evaluated while the claim is still editable.
   resetStore();
   adapter.calls.length = 0;
   adapter.mode = 'ok';
@@ -836,15 +853,30 @@ test('KNOWN GAP: a claim with no billed amount, CPT, or diagnosis still transmit
   assert.strictEqual(claimRow(ids.claim.id).billed_amount, null, 'the claim carries no amount');
 
   const row = body(await listClaims()).claims.find((r) => r.id === ids.claim.id);
-  assert.strictEqual(row.readiness.state, 'ready_to_review',
-    'readiness does not model the billable facts — a human verifies them');
+  assert.strictEqual(row.readiness.state, 'needs_correction',
+    'readiness models the billable facts and objects to all three');
   assert.strictEqual(row.cpt_code, null);
   assert.strictEqual(row.diagnosis_codes, null);
 
+  // Each missing fact is named separately, so the list tells you everything to
+  // fix rather than one thing at a time.
+  const codes = row.readiness.blockers.map((b) => b.code);
+  for (const code of ['claim_billed_amount', 'session_cpt_code', 'claim_diagnosis_codes']) {
+    assert.ok(codes.includes(code), `readiness names ${code}`);
+  }
+
   const res = await submitClaim(ids.claim.id);
-  assert.strictEqual(res.statusCode, 200, 'submit is NOT blocked');
-  assert.strictEqual(adapter.calls.length, 1, 'and the claim reached the clearinghouse');
-  assert.strictEqual(claimRow(ids.claim.id).status, 'submitted');
+  assert.strictEqual(res.statusCode, 422, 'submit is refused with 422');
+  // Blockers are emitted in submit's order, so the first one is what submit answers.
+  assert.match(body(res).error, /no billed amount/, 'answering with the first blocker');
+  assert.strictEqual(row.readiness.blockers[0].code, 'claim_billed_amount',
+    'and the projection agrees on which blocker that is');
+  assert.strictEqual(adapter.calls.length, 0, 'the clearinghouse was never called');
+
+  const after = claimRow(ids.claim.id);
+  assert.strictEqual(after.status, 'draft', 'the claim stays draft');
+  assert.strictEqual(after.submitted_at, null, 'and was never marked submitted');
+  assert.strictEqual(after.control_number, null, 'and has no control number');
 });
 
 // --- runner -------------------------------------------------------------------
