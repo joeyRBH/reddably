@@ -7,6 +7,9 @@
   "engines": {
     "node": ">=18"
   },
+  "scripts": {
+    "test": "node --test backend/tests/*.test.js"
+  },
   "dependencies": {
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.11.5"
