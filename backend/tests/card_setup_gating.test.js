@@ -1,21 +1,24 @@
 'use strict';
 
-// Unit tests — patient intake gating + auto client status
+// Unit tests — patient intake gating + the clinician confirm gate
 // (backend/handlers/card_setup.js).
+//
+// THE CENTRAL GUARANTEE: intake never makes a client billable. It writes the
+// patient's answers to the chart and stops there — a clinician confirms on the
+// chart ("Save as default", which goes through the authenticated
+// PATCH /clients/{id}). No intake route writes clients.status any more.
 //
 // Covers:
 //   * save-insurance REJECTS a payer-less save (no payer_id, no escape flag) — the
 //     UI gate is not the gate; this route is reachable with just the link token;
-//   * the "can't find my insurer" escape hatch saves with payer_id NULL and leaves
-//     the client on 'awaiting_info' (i.e. on the practice's follow-up list);
-//   * a complete intake promotes 'awaiting_info' → 'active', from either the
-//     insurance step or the details step (whichever completes the picture);
-//   * the transition is guarded to FROM 'awaiting_info' — a client the practice set
-//     to 'inactive' is never flipped back by a re-opened link;
-//   * a card on file is NOT required to become 'active';
+//   * the "can't find my insurer" escape hatch saves with payer_id NULL;
+//   * a COMPLETE intake still leaves the client 'awaiting_info' — from either the
+//     insurance step or the details step — and writes no status audit;
+//   * a client the practice set to 'inactive' or 'active' is left exactly as-is;
 //   * save-details validates the patient's biological sex against the
 //     female|male|unknown vocabulary and never nulls an existing value with a blank;
-//   * the status-change audit row carries field names only — no PHI.
+//   * the patient's answers still land on the chart, so the clinician has something
+//     to review.
 //
 // No network, no real DB: the db / payment_token modules are stubbed. Tests run
 // sequentially (they share the in-memory state).
@@ -42,7 +45,10 @@ const handler = require(path.join(__dirname, '..', 'handlers', 'card_setup.js'))
 
 // --- in-memory clients + insurance_records ----------------------------------
 
-const state = { client: null, insurance: null, audits: [] };
+// statusWrites is the tripwire for the central guarantee: it records every
+// `update clients set status = ...` the handler issues. It must stay empty for
+// every intake route, no matter how complete the submission is.
+const state = { client: null, insurance: null, audits: [], statusWrites: [] };
 
 // A client mid-intake: demographics already saved, no insurance yet, no card.
 // (No card on purpose — a client must be able to reach 'active' without one.)
@@ -69,6 +75,19 @@ function reset(clientOverrides, insurance) {
   state.client = freshClient(clientOverrides);
   state.insurance = insurance || null;
   state.audits = [];
+  state.statusWrites = [];
+}
+
+// Assert the central guarantee for the call that just ran: no status write was
+// issued, no status-change audit was recorded, and the client's status is
+// untouched.
+function assertNoStatusChange(expectedStatus) {
+  assert.deepStrictEqual(state.statusWrites, [], 'intake must never write clients.status');
+  assert.ok(
+    !state.audits.some((a) => a.action === 'client.status_change'),
+    'no status change, so no status-change audit'
+  );
+  assert.strictEqual(state.client.status, expectedStatus, 'status must be left alone');
 }
 
 function notBlank(v) {
@@ -173,8 +192,11 @@ dbLib.query = async (text, params) => {
     };
   }
 
-  // the guarded promotion: only ever awaiting_info -> active
-  if (/update clients set status = 'active'/.test(t)) {
+  // Tripwire: no intake route may write clients.status any more. Record the
+  // attempt AND perform it, so a regression fails loudly on both the recorded
+  // write and the flipped status rather than being papered over here.
+  if (/update clients set status/.test(t)) {
+    state.statusWrites.push(t);
     if (!c || c.is_hidden || c.status !== 'awaiting_info') return { rows: [], rowCount: 0 };
     c.status = 'active';
     return { rows: [], rowCount: 1 };
@@ -253,11 +275,7 @@ test('escape hatch saves with payer_id null and leaves the client awaiting follo
   assert.strictEqual(state.insurance.carrier_name, 'Aetna');
   assert.strictEqual(state.insurance.member_id, 'W123456789');
   assert.strictEqual(state.insurance.payer_id, null, 'payer_id must be null');
-  assert.strictEqual(
-    state.client.status,
-    'awaiting_info',
-    'an escape-hatch client is NOT claim-ready'
-  );
+  assertNoStatusChange('awaiting_info');
 });
 
 test('escape hatch clears a stale payer_id from an earlier pick', async () => {
@@ -273,40 +291,22 @@ test('escape hatch clears a stale payer_id from an earlier pick', async () => {
   assert.strictEqual(state.client.status, 'awaiting_info');
 });
 
-// --- 3. auto-activation on a complete intake --------------------------------
+// --- 3. the confirm gate: a complete intake does NOT make anyone billable ----
+// This is the point of the change. A patient filling in a form is a submission,
+// not an authorization to bill: a clinician confirms on the chart first. These
+// tests assert the ABSENCE of the old auto-promotion from every angle.
 
-test('a complete intake promotes awaiting_info -> active (with no card on file)', async () => {
+test('a COMPLETE intake leaves the client awaiting_info — a clinician confirms', async () => {
   reset();
-  assert.strictEqual(state.client.payment_method_id, null, 'precondition: no card');
   const res = await call('save-insurance', Object.assign({ payer_id: '60054' }, INSURANCE));
   assert.strictEqual(res.statusCode, 200);
-  assert.strictEqual(state.insurance.payer_id, '60054');
-  assert.strictEqual(state.client.status, 'active');
-
-  const statusAudit = state.audits.find((a) => a.action === 'client.status_change');
-  assert.ok(statusAudit, 'the status change must be audited');
-  assert.strictEqual(statusAudit.actor_type, 'patient_link');
-  assert.deepStrictEqual(statusAudit.metadata, {
-    fields_changed: ['status'],
-    status_from: 'awaiting_info',
-    status_to: 'active',
-  });
-  // No PHI in the audit metadata — no name, DOB, member id, carrier.
-  const blob = JSON.stringify(statusAudit.metadata);
-  ['W123456789', 'Aetna', '1990-01-01', '1 Main St'].forEach((phi) => {
-    assert.ok(!blob.includes(phi), 'audit metadata leaked PHI: ' + phi);
-  });
+  assert.strictEqual(state.insurance.payer_id, '60054', 'the insurance is still saved');
+  assertNoStatusChange('awaiting_info');
 });
 
-test('incomplete demographics keep the client awaiting_info even with a payer pick', async () => {
-  reset({ date_of_birth: null, address_line1: null, city: null, state: null, postal_code: null });
-  const res = await call('save-insurance', Object.assign({ payer_id: '60054' }, INSURANCE));
-  assert.strictEqual(res.statusCode, 200);
-  assert.strictEqual(state.client.status, 'awaiting_info');
-});
-
-test('the details step completes the picture and promotes the client', async () => {
-  // Insurance already on file (complete); demographics are the missing half.
+test('the details step completing the picture does NOT promote the client', async () => {
+  // Insurance already on file (complete); demographics are the missing half. This
+  // is the case that used to trip the promotion from the details step.
   reset(
     { date_of_birth: null, address_line1: null, city: null, state: null, postal_code: null },
     { id: 'ins_1', carrier_name: 'Aetna', member_id: 'W1', payer_id: '60054' }
@@ -319,7 +319,63 @@ test('the details step completes the picture and promotes the client', async () 
     postal_code: '80202',
   });
   assert.strictEqual(res.statusCode, 200);
-  assert.strictEqual(state.client.status, 'active');
+  assertNoStatusChange('awaiting_info');
+});
+
+test('a re-opened link that re-submits everything still promotes nothing', async () => {
+  // Both steps, in order, with a complete submission each time — the sequence a
+  // patient produces by finishing the flow and then re-opening the link.
+  reset({ date_of_birth: null, address_line1: null, city: null, state: null, postal_code: null });
+  const details = {
+    date_of_birth: '1990-01-01',
+    gender: 'female',
+    address_line1: '1 Main St',
+    city: 'Denver',
+    state: 'CO',
+    postal_code: '80202',
+  };
+  for (const step of ['first', 'second']) {
+    assert.strictEqual((await call('save-details', details)).statusCode, 200, step + ' details');
+    assert.strictEqual(
+      (await call('save-insurance', Object.assign({ payer_id: '60054' }, INSURANCE))).statusCode,
+      200,
+      step + ' insurance'
+    );
+  }
+  assertNoStatusChange('awaiting_info');
+});
+
+test("the patient's answers still reach the chart, so there is something to review", async () => {
+  // The gate is about STATUS, not about withholding the data: the clinician needs
+  // to see what the patient submitted in order to confirm it.
+  reset(
+    { date_of_birth: null, gender: null, address_line1: null, city: null, state: null, postal_code: null },
+    null
+  );
+  await call('save-details', {
+    date_of_birth: '1988-03-04',
+    gender: 'male',
+    address_line1: '7 Oak Ave',
+    city: 'Boulder',
+    state: 'CO',
+    postal_code: '80301',
+  });
+  await call('save-insurance', Object.assign({ payer_id: '60054' }, INSURANCE));
+
+  assert.strictEqual(state.client.date_of_birth, '1988-03-04');
+  assert.strictEqual(state.client.gender, 'male');
+  assert.strictEqual(state.client.address_line1, '7 Oak Ave');
+  assert.strictEqual(state.insurance.carrier_name, 'Aetna');
+  assert.strictEqual(state.insurance.member_id, 'W123456789');
+  assert.strictEqual(state.insurance.payer_id, '60054');
+  assertNoStatusChange('awaiting_info');
+});
+
+test('an incomplete intake is unchanged by the gate — still awaiting_info', async () => {
+  reset({ date_of_birth: null, address_line1: null, city: null, state: null, postal_code: null });
+  const res = await call('save-insurance', Object.assign({ payer_id: '60054' }, INSURANCE));
+  assert.strictEqual(res.statusCode, 200);
+  assertNoStatusChange('awaiting_info');
 });
 
 // --- 3b. biological sex captured at intake ----------------------------------
@@ -389,26 +445,21 @@ test('a blank biological sex does not null out the value already on file', async
   assert.strictEqual(state.client.gender, 'unknown');
 });
 
-// --- 4. the guard: never resurrect a client the practice retired -------------
+// --- 4. clients the practice already decided about are left alone ------------
 
 test('an inactive client is NOT flipped to active by re-opening the link', async () => {
   reset({ status: 'inactive' });
   const res = await call('save-insurance', Object.assign({ payer_id: '60054' }, INSURANCE));
   assert.strictEqual(res.statusCode, 200, 'the save itself still succeeds');
   assert.strictEqual(state.insurance.payer_id, '60054', 'the insurance is still saved');
-  assert.strictEqual(state.client.status, 'inactive', 'status must be left alone');
-  assert.ok(
-    !state.audits.some((a) => a.action === 'client.status_change'),
-    'no status change, so no status-change audit'
-  );
+  assertNoStatusChange('inactive');
 });
 
 test('an already-active client stays active and logs no spurious status change', async () => {
   reset({ status: 'active' });
   const res = await call('save-insurance', Object.assign({ payer_id: '60054' }, INSURANCE));
   assert.strictEqual(res.statusCode, 200);
-  assert.strictEqual(state.client.status, 'active');
-  assert.ok(!state.audits.some((a) => a.action === 'client.status_change'));
+  assertNoStatusChange('active');
 });
 
 // --- 4. self-reset: flipping the relationship to self clears policyholder PHI --

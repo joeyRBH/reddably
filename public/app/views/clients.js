@@ -594,6 +594,85 @@
       }, children);
     }
 
+    // --- The confirm gate: "Save as default" ---------------------------------
+    // Patient intake writes the patient's answers straight to this chart but never
+    // makes the client billable — backend/handlers/card_setup.js writes no status,
+    // so they stay 'awaiting_info' no matter how complete the submission looks.
+    // This banner is the clinician in the loop: it says the patient's information
+    // is here, and one click confirms it as the default for every future claim.
+    //
+    // Claims read the chart LIVE (a claim stores client_id + insurance_record_id,
+    // never a snapshot), so confirming is exactly "this chart is correct" — there
+    // is nothing else to copy anywhere. Correcting a value first is the existing
+    // Edit form; this button deliberately does not duplicate it.
+
+    function filled(v) { return v !== null && v !== undefined && String(v).trim() !== ''; }
+
+    // Has the patient supplied everything a claim needs? MIRRORS intakeCompleteness
+    // in backend/handlers/card_setup.js — demographics (DOB + full address) plus a
+    // primary policy with carrier, member id, and a routable payer id. A patient who
+    // took the "I can't find my insurer" escape hatch has no payer_id and so is not
+    // ready. Keep the two rules in step.
+    function intakeReady(client, insurance) {
+      if (!client) return false;
+      var demographicsOk = filled(client.date_of_birth)
+        && filled(client.address_line1) && filled(client.city)
+        && filled(client.state) && filled(client.postal_code);
+      if (!demographicsOk) return false;
+
+      var records = insurance || [];
+      var primary = null;
+      for (var i = 0; i < records.length; i++) {
+        if (records[i].is_primary && !records[i].is_hidden) { primary = records[i]; break; }
+      }
+      return !!primary && filled(primary.carrier_name)
+        && filled(primary.member_id) && filled(primary.payer_id);
+    }
+
+    // Confirm = the ordinary authenticated status change. No dedicated endpoint:
+    // PATCH /clients/{id} already validates the status and audits the change.
+    function saveAsDefault(client, button) {
+      button.disabled = true;
+      button.textContent = 'Saving…';
+      api.clients.update(client.id, { status: 'active' }).then(function () {
+        R.toast('Saved as default — ready for claims', 'success');
+        load();
+      }).catch(function (err) {
+        R.toast((err && err.message) || 'Could not confirm this client', 'error');
+        button.disabled = false;
+        button.textContent = 'Save as default';
+      });
+    }
+
+    function intakeReviewBanner(client, insurance) {
+      if (!client || client.status !== 'awaiting_info') return null;
+      if (!intakeReady(client, insurance)) return null;
+
+      var button = h('button', {
+        class: 'btn btn--primary', type: 'button',
+        onClick: function () { saveAsDefault(client, button); },
+      }, 'Save as default');
+
+      return h('div', {
+        class: 'stack',
+        style: 'gap:var(--space-3);padding:var(--space-4);border-radius:var(--radius-2);'
+          + 'background:var(--color-surface-sunken);'
+          + 'border-left:3px solid var(--color-border-strong)',
+      }, [
+        h('div', { style: 'display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap' }, [
+          h('span', { class: 'badge badge--neutral' }, 'Needs review'),
+          h('strong', null, 'Patient submitted their information'),
+        ]),
+        h('p', {
+          style: 'margin:0;color:var(--color-text-muted);font-size:var(--font-size-2);'
+            + 'max-width:60ch',
+        }, 'Everything a claim needs is on this chart. Check the details — use Edit to '
+          + 'correct anything first — then save them as the default for future claims. '
+          + 'This client is not billable until you do.'),
+        h('div', null, button),
+      ]);
+    }
+
     function headerCard(client, insurance) {
       var meta = [];
       if (client.email) meta.push(client.email);
@@ -1411,6 +1490,7 @@
 
       var view = h('div', { class: 'view stack' }, [
         backLink(),
+        intakeReviewBanner(client, insurance),
         headerCard(client, insurance),
         insurancePanel(client, insurance),
         sessionsPanel(client, sessions),

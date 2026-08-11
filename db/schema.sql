@@ -317,8 +317,12 @@ alter table clients add column if not exists diagnosis_codes text[];
 -- Migration (idempotent): retire the unused 'ready' client status. The allowed
 -- set is now exactly active / awaiting_info / inactive, where 'active' already
 -- means "ready for claim submission" — 'ready' was a synonym nothing ever set.
--- The patient intake flow now promotes a client to 'active' on its own once the
--- demographics + insurance a claim needs are on file (backend/handlers/card_setup.js).
+-- The patient intake flow does NOT set this status: it writes the patient's
+-- answers to the chart and leaves them 'awaiting_info'. A clinician confirms on
+-- the client chart ("Save as default"), which is an ordinary authenticated
+-- PATCH /clients/{id}. Intake briefly auto-promoted to 'active' on its own; that
+-- made a self-reported form the thing that decided who was billable, and it was
+-- removed (backend/handlers/card_setup.js).
 --
 -- Order matters: any surviving row must be moved OFF 'ready' BEFORE the CHECK is
 -- recreated, or the ALTER ... ADD CONSTRAINT fails validating those rows. They go

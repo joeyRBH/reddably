@@ -67,9 +67,11 @@ async function sendEmail(opts, deps) {
   return client.send(new SendEmailCommand(input));
 }
 
-// Compose the "intake completed" admin notification. PHI-minimal: the client's
-// name and a link to their chart only — no DOB, member ID, or diagnosis. Returns
-// { subject, text, html }.
+// Compose the "patient submitted their information" admin notification. Intake no
+// longer makes a client billable on its own — a clinician confirms on the chart
+// ("Save as default") — so this reads as a REVIEW request, not a completion
+// receipt. PHI-minimal: the client's name and a link to their chart only — no
+// DOB, member ID, or diagnosis. Returns { subject, text, html }.
 function buildIntakeCompletionEmail(opts) {
   const o = opts || {};
   const clientName = String(o.clientName || 'A client').trim() || 'A client';
@@ -77,21 +79,27 @@ function buildIntakeCompletionEmail(opts) {
   const chartUrl = o.chartUrl
     || (o.clientId ? `${APP_BASE_URL}/app/app.html#clients/${encodeURIComponent(o.clientId)}` : APP_BASE_URL);
 
-  const subject = `${clientName} completed intake`;
+  const subject = `${clientName} submitted their information`;
   const lines = [
-    `${clientName} has finished the intake flow.`,
+    `${clientName} submitted their information and it's ready for your review.`,
     '',
-    'Completed: payment method saved + insurance information submitted.',
+    'Submitted: payment method saved + insurance information provided.',
     `Time: ${completedAt}`,
     '',
-    `View their chart: ${chartUrl}`,
+    'Nothing is billable yet — open their chart, check the details, and choose',
+    '"Save as default" to confirm them for claims.',
+    '',
+    `Review their chart: ${chartUrl}`,
   ];
   const text = lines.join('\n');
   const html =
-    `<p><strong>${escapeHtml(clientName)}</strong> has finished the intake flow.</p>` +
-    `<p>Completed: payment method saved + insurance information submitted.<br>` +
+    `<p><strong>${escapeHtml(clientName)}</strong> submitted their information ` +
+    `and it's ready for your review.</p>` +
+    `<p>Submitted: payment method saved + insurance information provided.<br>` +
     `Time: ${escapeHtml(completedAt)}</p>` +
-    `<p><a href="${escapeHtml(chartUrl)}">View their chart</a></p>`;
+    `<p>Nothing is billable yet — open their chart, check the details, and choose ` +
+    `<strong>Save as default</strong> to confirm them for claims.</p>` +
+    `<p><a href="${escapeHtml(chartUrl)}">Review their chart</a></p>`;
   return { subject, text, html };
 }
 

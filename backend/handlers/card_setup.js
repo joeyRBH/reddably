@@ -18,11 +18,14 @@
 // patient (non-staff) flow, so there is no requireAuth / practice JWT here.
 // Never store a raw PAN/CVC (PCI); never log PHI.
 //
-// Intake also OWNS clients.status: finishing the flow with everything a claim needs
-// (demographics + carrier + member id + payer id) promotes the client
-// 'awaiting_info' → 'active'; anything missing leaves them 'awaiting_info' for staff
-// follow-up. See activateIfIntakeComplete — it is the only place this flow writes
-// status, and it only ever transitions FROM 'awaiting_info'.
+// Intake does NOT make a client billable. It writes the patient's answers to the
+// chart, but a clinician confirms them there ("Save as default" on the client
+// chart) before the client becomes 'active'. This flow therefore writes NO status
+// at all: a patient who finishes intake stays 'awaiting_info' until a human says
+// otherwise. It used to auto-promote 'awaiting_info' → 'active' the moment the
+// answers looked complete, with no one in the loop — a fuzzy self-reported form
+// made someone billable. See intakeCompleteness for the readiness rule the chart's
+// confirm affordance mirrors.
 
 const db = require('../lib/db');
 const paymentToken = require('../lib/payment_token');
@@ -90,10 +93,12 @@ async function resolveNotificationEmail(practiceId) {
   }
 }
 
-// Fire the "intake completed" admin email after the final intake step (insurance
-// saved). Best-effort and fully non-blocking: any failure (SES not verified yet,
-// no recipient, send error) is logged and swallowed so the patient's request
-// still succeeds. PHI-minimal — only the client's name + a chart link are sent.
+// Fire the "patient submitted their information" admin email after the final
+// intake step (insurance saved). This is a REVIEW request — the client is not
+// billable until a clinician confirms on the chart. Best-effort and fully
+// non-blocking: any failure (SES not verified yet, no recipient, send error) is
+// logged and swallowed so the patient's request still succeeds. PHI-minimal —
+// only the client's name + a chart link are sent.
 async function notifyIntakeComplete(client) {
   try {
     const to = await resolveNotificationEmail(client.practice_id);
@@ -117,7 +122,13 @@ function cleanField(v) {
   return v.trim();
 }
 
-// --- intake completion → client status ---------------------------------------
+// --- intake readiness ---------------------------------------------------------
+//
+// This is the DEFINITION of "the patient has given us everything a claim needs".
+// It no longer changes anything on its own: it used to back an auto-promotion to
+// 'active' that ran with no human in the loop, and that promotion is gone. It
+// stays as the single written statement of the rule — the client chart's "Save as
+// default" affordance mirrors it to decide when to offer the confirm.
 
 // Is this client claim-ready? True only when intake has produced everything an
 // 837P needs FROM THE PATIENT:
@@ -161,41 +172,12 @@ async function intakeCompleteness(clientId) {
   };
 }
 
-// Promote the client to 'active' once intake is complete. 'active' IS the
-// claim-ready status. Anything missing — including the "I can't find my insurance
-// company" escape hatch, which saves a null payer_id on purpose — leaves them on
-// 'awaiting_info', so they land on the practice's follow-up list instead of looking
-// done.
-//
-// GUARD: the only transition is awaiting_info → active, enforced in the WHERE clause.
-// A client the practice deliberately set to 'inactive' is never flipped back just
-// because the intake link got re-opened, and an already-'active' client is left alone.
-//
-// Audited via the shared helper — status is not PHI, so the field name and the
-// from/to values are safe to record. Best-effort: a failure here is logged and
-// swallowed, never failing the patient's save.
-async function activateIfIntakeComplete(event, client) {
-  try {
-    const { demographicsOk, insuranceOk } = await intakeCompleteness(client.id);
-    if (!demographicsOk || !insuranceOk) return;
-
-    const res = await db.query(
-      `update clients set status = 'active'
-        where id = $1 and is_hidden = false and status = 'awaiting_info'`,
-      [client.id]
-    );
-    if (res.rowCount === 0) return; // already active, or deliberately inactive
-
-    await audit(event, { actorType: 'patient_link', practiceId: client.practice_id }, {
-      action: 'client.status_change',
-      resourceType: 'client',
-      resourceId: client.id,
-      metadata: { fields_changed: ['status'], status_from: 'awaiting_info', status_to: 'active' },
-    });
-  } catch (err) {
-    console.warn('card_setup activateIfIntakeComplete failed:', err && err.message);
-  }
-}
+// NOTE: activateIfIntakeComplete used to live here and promoted 'awaiting_info' →
+// 'active' from both intake steps. It is deliberately GONE, not merely unwired: a
+// helper whose whole job is to make a client billable without a human is one call
+// site away from coming back. Confirmation is now a staff action on the client
+// chart, which goes through the ordinary authenticated PATCH /clients/{id} and is
+// audited there like any other staff status change.
 
 exports.handler = async (event) => {
   const method = httpMethod(event);
@@ -362,14 +344,8 @@ exports.handler = async (event) => {
         { action: 'patient_link.save_details', resourceType: 'client', resourceId: clientId }
       );
 
-      // Demographics may be the last thing missing — a patient can re-open the link
-      // with insurance already on file — so re-evaluate readiness here too, not just
-      // at the end of the insurance step.
-      await activateIfIntakeComplete(event, {
-        id: clientId,
-        practice_id: result.rows[0] ? result.rows[0].practice_id : null,
-      });
-
+      // No status write here. Demographics landing on the chart does not make the
+      // client billable — a clinician confirms on the chart.
       return json(200, { ok: true }, event);
     }
 
@@ -532,9 +508,9 @@ exports.handler = async (event) => {
         );
       }
 
-      // Insurance is the final intake step: demographics + insurance are now on file.
-      // Notify the practice admin. Non-blocking — a send failure (SES not verified
-      // yet, etc.) never fails the patient's request.
+      // Insurance is the final intake step: demographics + insurance are now on file
+      // and waiting for review. Notify the practice admin. Non-blocking — a send
+      // failure (SES not verified yet, etc.) never fails the patient's request.
       await notifyIntakeComplete(client);
 
       await audit(event, { actorType: 'patient_link', practiceId: client.practice_id }, {
@@ -543,10 +519,8 @@ exports.handler = async (event) => {
         resourceId: client.id,
       });
 
-      // Final step: promote to 'active' if nothing a claim needs is missing. A patient
-      // who took the escape hatch has no payer_id, so they stay 'awaiting_info'.
-      await activateIfIntakeComplete(event, client);
-
+      // No status write here either. The client stays 'awaiting_info' — on the
+      // practice's follow-up list — until a clinician confirms on the chart.
       return json(200, { ok: true }, event);
     }
 
