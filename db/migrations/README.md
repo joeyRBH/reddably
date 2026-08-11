@@ -88,3 +88,20 @@ done
   `sessions` directly: a row is promoted to a session only on explicit human
   confirmation, so a fuzzy name match can never create a billable session on its
   own.
+
+## One-off data backfills
+
+Some corrections are data, not schema, and need application logic (the same helpers
+the API uses) rather than SQL. Those live as operator-run Node scripts under
+`backend/scripts/`. They follow the same discipline as the migrations here: **never
+auto-applied** — nothing runs them on deploy — idempotent, and safe to re-run.
+
+- `backend/scripts/backfill-claim-derived-fields.js` — unsticks existing claims by
+  re-deriving the two fields that strand them: `insurance_record_id` (the client's
+  primary coverage, via the same `primaryInsuranceForClient()` helper `POST /claims`
+  uses) and `billed_amount` (the session fee, exactly as `regenerateClaim()` derives
+  it). Only claims in a regeneratable status (`draft` / `denied`) are considered, only
+  MISSING values are filled, and `status` is never changed. **Dry run by default** —
+  it writes nothing and prints a summary; `--apply` writes inside one transaction with
+  an `audit_log` row per claim. The script header documents the exact commands and the
+  pre/post checks.
