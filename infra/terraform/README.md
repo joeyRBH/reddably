@@ -16,7 +16,7 @@ an API Gateway HTTP API, and the ACM cert + custom domain.
 | File              | Concern                                                            |
 | ----------------- | ----------------------------------------------------------------- |
 | `providers.tf`    | Terraform + AWS/archive provider versions, default tags           |
-| `backend.tf`      | S3 remote state (bucket/lock table created out-of-band first)     |
+| `backend.tf`      | S3 remote state + native locking (bucket created out-of-band first) |
 | `variables.tf`    | All inputs (+ `terraform.tfvars.example`)                         |
 | `locals.tf`       | Name prefix, SSM namespace, the register/login/me function map    |
 | `data.tf`         | Account/region/partition/AZ lookups                              |
@@ -42,9 +42,10 @@ an API Gateway HTTP API, and the ACM cert + custom domain.
    export AWS_PROFILE=claimsub-prod
    export AWS_REGION=us-west-2          # must match backend.tf + var.aws_region
    ```
-2. **Terraform** `>= 1.7` (developed on 1.14).
-3. **Remote state backend** — create these once, out-of-band, before the first
-   `terraform init` (they can't be managed by this config — chicken/egg):
+2. **Terraform** `>= 1.10` (developed on 1.14). 1.10 is the floor for S3 native
+   state locking — an older version ignores `use_lockfile` and runs with no lock.
+3. **Remote state backend** — create the bucket once, out-of-band, before the
+   first `terraform init` (it can't be managed by this config — chicken/egg):
    ```bash
    aws s3api create-bucket \
      --bucket claimsub-terraform-state \
@@ -57,12 +58,12 @@ an API Gateway HTTP API, and the ACM cert + custom domain.
      --bucket claimsub-terraform-state \
      --server-side-encryption-configuration \
        '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}'
-   aws dynamodb create-table \
-     --table-name claimsub-terraform-locks \
-     --attribute-definitions AttributeName=LockID,AttributeType=S \
-     --key-schema AttributeName=LockID,KeyType=HASH \
-     --billing-mode PAY_PER_REQUEST
    ```
+   **No DynamoDB lock table.** State locking is S3 native (`use_lockfile` in
+   `backend.tf`): Terraform takes a conditional-write lock file next to the state
+   in the same bucket. The old `claimsub-terraform-locks` table is not needed and
+   is not recreated — if one still exists in the account, it can be deleted.
+
    If you use different names/region, override at init with
    `terraform init -backend-config=backend.hcl` instead of editing `backend.tf`.
 4. **Package the Lambda artifact** — install backend deps so `node_modules` is
