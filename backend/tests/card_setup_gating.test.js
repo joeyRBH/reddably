@@ -13,6 +13,8 @@
 //   * the transition is guarded to FROM 'awaiting_info' — a client the practice set
 //     to 'inactive' is never flipped back by a re-opened link;
 //   * a card on file is NOT required to become 'active';
+//   * save-details validates the patient's biological sex against the
+//     female|male|unknown vocabulary and never nulls an existing value with a blank;
 //   * the status-change audit row carries field names only — no PHI.
 //
 // No network, no real DB: the db / payment_token modules are stubbed. Tests run
@@ -52,6 +54,7 @@ function freshClient(overrides) {
       status: 'awaiting_info',
       is_hidden: false,
       date_of_birth: '1990-01-01',
+      gender: 'female',
       address_line1: '1 Main St',
       city: 'Denver',
       state: 'CO',
@@ -85,10 +88,14 @@ dbLib.query = async (text, params) => {
   if (/from practices/.test(t)) return { rows: [{ recipient: null }], rowCount: 1 };
 
   // save-details
+  // Param layout: $1 dob, $2 gender, $3 address1, $4 address2, $5 city, $6 state,
+  // $7 postal_code, $8 phone, $9 client id. Every column uses
+  // coalesce(nullif($n, ''), col) — a blank incoming value keeps what is on file.
   if (/update clients set\s*\n?\s*date_of_birth/.test(t) || /date_of_birth = coalesce/.test(t)) {
     if (!c) return { rows: [], rowCount: 0 };
-    const [dob, a1, , city, st, zip] = params;
+    const [dob, gender, a1, , city, st, zip] = params;
     if (notBlank(dob)) c.date_of_birth = dob;
+    if (notBlank(gender)) c.gender = gender;
     if (notBlank(a1)) c.address_line1 = a1;
     if (notBlank(city)) c.city = city;
     if (notBlank(st)) c.state = st;
@@ -313,6 +320,73 @@ test('the details step completes the picture and promotes the client', async () 
   });
   assert.strictEqual(res.statusCode, 200);
   assert.strictEqual(state.client.status, 'active');
+});
+
+// --- 3b. biological sex captured at intake ----------------------------------
+// The 837P needs the patient's gender demographic whenever the patient IS the
+// subscriber. Intake now asks for it, so staff no longer key it in by hand.
+
+test('save-details persists a valid biological sex', async () => {
+  reset({ gender: null });
+  const res = await call('save-details', {
+    date_of_birth: '1990-01-01',
+    gender: 'male',
+    address_line1: '1 Main St',
+    city: 'Denver',
+    state: 'CO',
+    postal_code: '80202',
+  });
+  assert.strictEqual(res.statusCode, 200);
+  assert.strictEqual(state.client.gender, 'male');
+});
+
+test('save-details accepts every value in the female|male|unknown vocabulary', async () => {
+  for (const value of ['female', 'male', 'unknown']) {
+    reset({ gender: null });
+    const res = await call('save-details', { gender: value });
+    assert.strictEqual(res.statusCode, 200, value + ' should be accepted');
+    assert.strictEqual(state.client.gender, value);
+  }
+});
+
+test('save-details lower-cases the submitted value before storing it', async () => {
+  // The DB CHECK only admits lowercase; a capitalized value must not 400 OR be
+  // stored verbatim.
+  reset({ gender: null });
+  const res = await call('save-details', { gender: 'Female' });
+  assert.strictEqual(res.statusCode, 200);
+  assert.strictEqual(state.client.gender, 'female');
+});
+
+test('save-details rejects a biological sex outside the vocabulary', async () => {
+  reset({ gender: null });
+  const res = await call('save-details', {
+    date_of_birth: '1990-01-01',
+    gender: 'other',
+    address_line1: '1 Main St',
+    city: 'Denver',
+    state: 'CO',
+    postal_code: '80202',
+  });
+  assert.strictEqual(res.statusCode, 400, 'expected a 400, got ' + res.statusCode);
+  assert.match(JSON.parse(res.body).error, /invalid biological sex/i);
+  assert.strictEqual(state.client.gender, null, 'nothing should have been written');
+});
+
+test('a blank biological sex does not null out the value already on file', async () => {
+  // A patient who re-opens the link and re-submits the step without touching the
+  // select must not wipe what staff (or an earlier submission) already recorded.
+  reset({ gender: 'unknown' });
+  const res = await call('save-details', {
+    date_of_birth: '1990-01-01',
+    gender: '',
+    address_line1: '1 Main St',
+    city: 'Denver',
+    state: 'CO',
+    postal_code: '80202',
+  });
+  assert.strictEqual(res.statusCode, 200);
+  assert.strictEqual(state.client.gender, 'unknown');
 });
 
 // --- 4. the guard: never resurrect a client the practice retired -------------

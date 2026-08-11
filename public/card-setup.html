@@ -326,6 +326,20 @@
             <input id="dt-dob" class="input" type="date" autocomplete="bday">
           </div>
 
+          <!-- Biological sex — required. The 837P needs the patient's gender
+               demographic whenever the patient IS the subscriber, and without it
+               here staff key it in by hand on every self-insured client. Same
+               vocabulary as the chart (female|male|unknown). -->
+          <div class="field">
+            <label for="dt-sex" id="dt-sex-label">Biological sex</label>
+            <select id="dt-sex" class="input">
+              <option value="">Select…</option>
+              <option value="male">M</option>
+              <option value="female">F</option>
+              <option value="unknown">U</option>
+            </select>
+          </div>
+
           <div class="field">
             <label for="dt-phone">Mobile phone <span aria-hidden="true">(optional)</span></label>
             <input id="dt-phone" class="input" type="tel" autocomplete="tel"
@@ -631,6 +645,8 @@
         }
         var dobLabel = $('dt-dob-label');
         if (dobLabel) dobLabel.textContent = capitalize(intake.possessive()) + ' date of birth';
+        var sexLabel = $('dt-sex-label');
+        if (sexLabel) sexLabel.textContent = capitalize(intake.possessive()) + ' biological sex';
         var midLabel = $('ins-member-label');
         if (midLabel) midLabel.textContent = capitalize(intake.possessive()) + ' member ID';
         var relSel = $('ins-relationship');
@@ -692,6 +708,7 @@
 
           var fields = {
             date_of_birth: $('dt-dob').value.trim(),
+            gender: $('dt-sex').value,
             address_line1: $('dt-address1').value.trim(),
             address_line2: $('dt-address2').value.trim(),
             city: $('dt-city').value.trim(),
@@ -714,6 +731,11 @@
           // is a real gate, not a nudge.
           if (!fields.date_of_birth) {
             showDtError('Please enter ' + intake.possessive() + ' date of birth'
+              + (intake.onBehalf() ? ' — not your own.' : '.'));
+            return;
+          }
+          if (!fields.gender) {
+            showDtError('Please choose ' + intake.possessive() + ' biological sex'
               + (intake.onBehalf() ? ' — not your own.' : '.'));
             return;
           }

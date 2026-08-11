@@ -303,11 +303,15 @@ exports.handler = async (event) => {
     }
 
     if (path === 'save-details') {
-      // Patient-supplied demographics needed to build a claim: date of birth +
-      // current address. Persisted to the clients row (columns already exist —
+      // Patient-supplied demographics needed to build a claim: date of birth,
+      // biological sex, and current address. Persisted to the clients row (columns already exist —
       // db/migrations/002). All optional individually; a blank field never nulls
       // out existing data (coalesce(nullif(...))). No card/PCI data here.
       const dateOfBirth = cleanField(body.date_of_birth);
+      // Patient's biological sex — the 837P subscriber demographic required when the
+      // patient IS the subscriber ('self'). Same female|male|unknown vocabulary the
+      // clients_gender_check CHECK enforces; lower-cased before validating.
+      const gender = cleanField(body.gender).toLowerCase();
       const addressLine1 = cleanField(body.address_line1);
       const addressLine2 = cleanField(body.address_line2);
       const city = cleanField(body.city);
@@ -320,6 +324,9 @@ exports.handler = async (event) => {
       }
       if (dateOfBirth && !/^\d{4}-\d{2}-\d{2}$/.test(dateOfBirth)) {
         return json(400, { error: 'Date of birth must be YYYY-MM-DD.' }, event);
+      }
+      if (gender && !['female', 'male', 'unknown'].includes(gender)) {
+        return json(400, { error: 'Invalid biological sex.' }, event);
       }
 
       // Optional phone: normalize to E.164 (Twilio SMS requires it). Blank is
@@ -337,15 +344,16 @@ exports.handler = async (event) => {
       const result = await db.query(
         `update clients set
             date_of_birth = coalesce(nullif($1, '')::date, date_of_birth),
-            address_line1 = coalesce(nullif($2, ''), address_line1),
-            address_line2 = coalesce(nullif($3, ''), address_line2),
-            city          = coalesce(nullif($4, ''), city),
-            state         = coalesce(nullif($5, ''), state),
-            postal_code   = coalesce(nullif($6, ''), postal_code),
-            phone         = coalesce(nullif($7, ''), phone)
-          where id = $8 and is_hidden = false
+            gender        = coalesce(nullif($2, ''), gender),
+            address_line1 = coalesce(nullif($3, ''), address_line1),
+            address_line2 = coalesce(nullif($4, ''), address_line2),
+            city          = coalesce(nullif($5, ''), city),
+            state         = coalesce(nullif($6, ''), state),
+            postal_code   = coalesce(nullif($7, ''), postal_code),
+            phone         = coalesce(nullif($8, ''), phone)
+          where id = $9 and is_hidden = false
           returning practice_id`,
-        [dateOfBirth, addressLine1, addressLine2, city, state, postalCode, phone, clientId]
+        [dateOfBirth, gender, addressLine1, addressLine2, city, state, postalCode, phone, clientId]
       );
       if (result.rowCount === 0) return json(404, { error: 'Not found' }, event);
       await audit(

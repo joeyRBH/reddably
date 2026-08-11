@@ -220,7 +220,9 @@
     // Persist the patient's demographics (date of birth + current address) to the
     // client record so a claim can be built without manual re-entry. Hits the
     // Lambda API (card_setup handler) directly — no Stripe/Twilio egress.
-    // fields: { date_of_birth?, phone?, address_line1?, address_line2?, city?, state?, postal_code? }
+    // fields: { date_of_birth?, gender?, phone?, address_line1?, address_line2?, city?,
+    //           state?, postal_code? }  — gender is female|male|unknown (837P subscriber
+    //           demographic when the patient is the subscriber).
     saveDetails: function (token, fields) {
       var payload = { token: token };
       Object.keys(fields || {}).forEach(function (k) { payload[k] = fields[k]; });
