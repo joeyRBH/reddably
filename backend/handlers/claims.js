@@ -46,6 +46,11 @@ const {
   missingSubscriberField,
   missingDependentPolicyholderField,
   invalidSessionPlaceOfService,
+  missingBilledAmount,
+  missingSessionCptCode,
+  missingDiagnosisCodes,
+  excessDiagnosisCodes,
+  missingPayerId,
   BLOCKER_MESSAGES,
   placeOfServiceBlockerMessage,
   ageInYears,
@@ -251,6 +256,8 @@ function readinessContext(r) {
     claim: r,
     session: {
       place_of_service: r.session_place_of_service,
+      cpt_code: r.session_cpt_code,
+      diagnosis_codes: r.session_diagnosis_codes,
     },
     client: {
       date_of_birth: r.client_date_of_birth,
@@ -267,6 +274,7 @@ function readinessContext(r) {
           subscriber_name: r.ins_subscriber_name,
           subscriber_dob: r.ins_subscriber_dob,
           member_id: r.ins_member_id,
+          payer_id: r.payer_id,
         }
       : null,
   };
@@ -741,6 +749,32 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   const sessionPlaceOfService = invalidSessionPlaceOfService(ctx.session);
   if (sessionPlaceOfService != null) {
     return json(422, { error: placeOfServiceBlockerMessage() }, event);
+  }
+
+  // Billable CONTENT — the charge, the procedure code, the diagnoses and the
+  // payer that routes the claim. Everything above this point is setup and
+  // demographics; without these the claim either bills nothing or cannot be
+  // addressed, and the clearinghouse rejects it. Two of them are worse than a
+  // rejection: a missing payer id and an over-limit diagnosis list make the
+  // adapter throw while BUILDING the body, which happens after the claim has
+  // already moved to 'submitted' below — leaving a claim that was never
+  // transmitted stranded in a retry-blocked state. Blocking here keeps it a draft,
+  // with a message that names the fix. The adapter's own throws stay in place as
+  // a backstop for direct callers; normal flow never reaches them.
+  if (missingBilledAmount(claim)) {
+    return json(422, { error: BLOCKER_MESSAGES.claim_billed_amount }, event);
+  }
+  if (missingSessionCptCode(ctx.session)) {
+    return json(422, { error: BLOCKER_MESSAGES.session_cpt_code }, event);
+  }
+  if (missingDiagnosisCodes(ctx.session)) {
+    return json(422, { error: BLOCKER_MESSAGES.claim_diagnosis_codes }, event);
+  }
+  if (excessDiagnosisCodes(ctx.session) != null) {
+    return json(422, { error: BLOCKER_MESSAGES.claim_diagnosis_limit }, event);
+  }
+  if (missingPayerId(ctx.insurance)) {
+    return json(422, { error: BLOCKER_MESSAGES.insurance_payer_id }, event);
   }
 
   // Replacement (CMS frequency 7) safety gate. A replacement asks the payer to
@@ -1534,6 +1568,11 @@ exports.missingBillingAddressField = missingBillingAddressField;
 exports.missingSubscriberField = missingSubscriberField;
 exports.missingDependentPolicyholderField = missingDependentPolicyholderField;
 exports.invalidSessionPlaceOfService = invalidSessionPlaceOfService;
+exports.missingBilledAmount = missingBilledAmount;
+exports.missingSessionCptCode = missingSessionCptCode;
+exports.missingDiagnosisCodes = missingDiagnosisCodes;
+exports.excessDiagnosisCodes = excessDiagnosisCodes;
+exports.missingPayerId = missingPayerId;
 exports.evaluateSubmissionWarnings = evaluateSubmissionWarnings;
 exports.ageInYears = ageInYears;
 exports.REGENERATABLE_STATUSES = REGENERATABLE_STATUSES;
