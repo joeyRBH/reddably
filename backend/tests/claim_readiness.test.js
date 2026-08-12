@@ -66,6 +66,7 @@ const handlerSource = fs.readFileSync(
   'missingDiagnosisCodes',
   'excessDiagnosisCodes',
   'missingPayerId',
+  'unresolvableInsuranceRecord',
 ].forEach((name) => {
   assert.ok(
     !new RegExp(`function\\s+${name}\\s*\\(`).test(handlerSource),
@@ -95,6 +96,7 @@ assert.ok(
   'This claim has no diagnosis code',
   'at most 12 diagnosis codes',
   'no routable payer ID',
+  'insurance record is no longer available',
 ].forEach((fragment) => {
   assert.ok(
     handlerSource.indexOf(fragment) === -1,
@@ -250,10 +252,41 @@ r = readiness.evaluateClaimReadiness(ctx({
 assert.strictEqual(r.state, 'ready_to_review',
   'duplicates collapse before the limit is applied, as they do on the wire');
 
-// A NULL insurance context is missingInsuranceRecord's case, not the payer id's —
-// on the list projection that is also how a HIDDEN record presents, and the
-// projection has always treated a hidden record as absent.
+// A NULL insurance context is not the payer id's case — it is either "no coverage
+// named" (missingInsuranceRecord, 400) or "coverage named but gone"
+// (unresolvableInsuranceRecord, 422). Each of the three answers exactly one
+// question, and the null record belongs to the other two.
 assert.strictEqual(readiness.missingPayerId(null), false);
+
+// 8b. Coverage that is NAMED but does not resolve. This is the route that made a
+//     claim strand: the id is present so missingInsuranceRecord passes, the
+//     record is null so missingPayerId abstains, and the builder then throws
+//     locally on the absent payer id — after the claim has been marked submitted.
+assert.strictEqual(
+  readiness.unresolvableInsuranceRecord({ insurance_record_id: 'i1' }, null), true,
+  'a named record that did not load is unresolvable');
+assert.strictEqual(
+  readiness.unresolvableInsuranceRecord({ insurance_record_id: 'i1' }, OK_INSURANCE), false,
+  'a named record that loaded is fine');
+// No coverage named at all stays missingInsuranceRecord's case (400), so this
+// blocker abstains and the user is told to attach coverage, not that it vanished.
+[null, undefined, '', '   '].forEach((v) => {
+  assert.strictEqual(readiness.unresolvableInsuranceRecord({ insurance_record_id: v }, null), false,
+    `insurance_record_id ${JSON.stringify(v)} is the missing-insurance case, not the unresolvable one`);
+});
+assert.strictEqual(readiness.unresolvableInsuranceRecord(null, null), false);
+
+r = readiness.evaluateClaimReadiness(ctx({ insurance: null }));
+assert.strictEqual(r.state, 'needs_correction', 'a vanished insurance record blocks');
+assert.deepStrictEqual(r.blockers.map((b) => b.code), ['insurance_unresolvable'],
+  'and reports the vanished coverage alone — not the payer id it can no longer read');
+assert.strictEqual(r.blockers[0].status, 422);
+assert.strictEqual(r.blockers[0].message,
+  "This claim's insurance record is no longer available — attach the client's current coverage before submitting.");
+// It never displaces the 400: with no coverage named, that is still the answer.
+r = readiness.evaluateClaimReadiness(ctx({ claim: { insurance_record_id: null, billed_amount: '150.00' }, insurance: null }));
+assert.deepStrictEqual(r.blockers.map((b) => b.code), ['missing_insurance_record']);
+assert.strictEqual(r.blockers[0].status, 400);
 
 // A positive charge in any of the shapes pg / the API hand us is submittable.
 ['150.00', 150, '0.01'].forEach((v) => {
@@ -332,8 +365,12 @@ function route(sql, params) {
   if (/select 1 from claims/i.test(sql)) return none();
   if (/from claims\b/i.test(sql)) return one(state.claim);
   if (/provider_billing_profiles/i.test(sql)) return none();
+  // A NULL fixture means "no row matched" — how an is_hidden-filtered load
+  // presents when the record has been soft-deleted out from under the claim.
   for (const table of Object.keys(fixtures)) {
-    if (new RegExp(`from ${table}\\b`, 'i').test(sql)) return one(fixtures[table]);
+    if (new RegExp(`from ${table}\\b`, 'i').test(sql)) {
+      return fixtures[table] ? one(fixtures[table]) : none();
+    }
   }
   return none();
 }
@@ -526,6 +563,14 @@ function assertNoMutationOrTransmission(label) {
     }, 'A claim can carry at most 12 diagnosis codes.'],
     ['no payer id', () => { fixtures.insurance_records = { ...fixtures.insurance_records, payer_id: null }; },
       "This client's insurance has no routable payer ID — re-run intake or set the payer on the insurance record."],
+    // The claim still NAMES a record (insurance_record_id is set) but the
+    // is_hidden-filtered load finds nothing. The id-only missing-insurance check
+    // passes and the payer-id check abstains on a null record, so before this
+    // blocker the claim reached the builder with no coverage and threw locally —
+    // stranded as 'submitted' having transmitted nothing.
+    ['insurance record hidden after the claim was created',
+      () => { fixtures.insurance_records = null; },
+      "This claim's insurance record is no longer available — attach the client's current coverage before submitting."],
   ];
   for (const [label, breakIt, message] of contentBlockerCases) {
     resetSubmitFixtures();
@@ -731,14 +776,30 @@ function assertNoMutationOrTransmission(label) {
   // A hidden insurance record is treated as absent — exactly what submit's
   // is_hidden-filtered load does — so the projection blocks on missing coverage
   // context rather than reading a record submit would never see.
+  //
+  // This previously asserted ready_to_review, on the reasoning that a hidden
+  // record is "invisible to the projection, as it is to submit". The invisibility
+  // matched; the verdict did not. The claim still NAMES the record, so submit's
+  // missing-insurance blocker (which reads only the id) passed, the payer-id
+  // blocker ignored the null record, and the claim reached the builder with no
+  // coverage — throwing locally AFTER it had been marked submitted. Saying
+  // "ready" about a claim that strands is the failure the projection exists to
+  // prevent, so both paths now block it.
   state.listRows = [listRow({
     id: 'd-hidden-ins', ins_is_hidden: true,
     ins_subscriber_relationship: 'child', ins_subscriber_name: '', ins_subscriber_dob: null,
   })];
   res = await claims3.handler(listEvent(null));
   const hidden = parse(res).claims[0];
-  assert.strictEqual(hidden.readiness.state, 'ready_to_review',
-    'a hidden insurance record is invisible to the projection, as it is to submit');
+  assert.strictEqual(hidden.readiness.state, 'needs_correction',
+    'a claim naming a hidden insurance record is flagged, not called ready');
+  assert.deepStrictEqual(hidden.readiness.blockers.map((b) => b.code), ['insurance_unresolvable'],
+    'and the blocker names the vanished coverage, not the payer id');
+  assert.strictEqual(hidden.readiness.blockers[0].status, 422);
+  // The hidden record's own fields are never read: it is absent, so the
+  // dependent-policyholder blocker (which those fields would trip) stays silent.
+  assert.ok(!hidden.readiness.blockers.some((b) => b.code === 'dependent_policyholder'),
+    'a record submit would never load is never evaluated');
 
   // 12b. The content blockers feed the projection too, so the list flags a claim
   //      as "needs correction" BEFORE anyone clicks submit — the whole point of
