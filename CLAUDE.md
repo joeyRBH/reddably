@@ -161,6 +161,21 @@ only to attach claims to). Those belong to Sessionably.
 - One PR per logical unit of work. Do NOT merge — the user reviews and merges.
 - Never commit secrets; respect `.gitignore` (`.env*` etc.). Only `.env.example` is tracked.
 
+## Taking an idea (default working mode)
+
+The user gives ideas in plain English, not pre-written prompts. When you get one:
+
+1. If it's unambiguous and does NOT touch the money path (fee, submit, Stripe) or
+   change claim behavior — restate it in one line, then just build it. Don't wait
+   for a formal prompt.
+2. If it IS money-path/claim-behavioral, OR you'd have to guess at a product
+   decision — stop and ask ONE clear question before coding. Flag in the PR body:
+   "Money-path change — recommend diff review before merge."
+3. Always one PR per logical unit. If an idea is really several units, say so and
+   propose the split before starting.
+4. The test-before-PR gate below ("Before opening a PR") is non-negotiable
+   regardless of how small the idea.
+
 ## Before opening a PR
 
 Verification happens BEFORE the commit, not after the PR. All three steps below are
