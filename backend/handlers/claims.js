@@ -51,6 +51,7 @@ const {
   missingDiagnosisCodes,
   excessDiagnosisCodes,
   missingPayerId,
+  unresolvableInsuranceRecord,
   BLOCKER_MESSAGES,
   placeOfServiceBlockerMessage,
   ageInYears,
@@ -772,6 +773,15 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   }
   if (excessDiagnosisCodes(ctx.session) != null) {
     return json(422, { error: BLOCKER_MESSAGES.claim_diagnosis_limit }, event);
+  }
+  // Coverage the claim NAMES but that no longer loads (the record was hidden
+  // after the claim was created). missingInsuranceRecord above only saw the id,
+  // which is present, and missingPayerId ignores a null record — so without this
+  // the claim reached the builder with no coverage at all and threw locally on
+  // the absent payer id, stranding a claim that was never transmitted. Checked
+  // here, against the built context, because it needs the loaded record.
+  if (unresolvableInsuranceRecord(claim, ctx.insurance)) {
+    return json(422, { error: BLOCKER_MESSAGES.insurance_unresolvable }, event);
   }
   if (missingPayerId(ctx.insurance)) {
     return json(422, { error: BLOCKER_MESSAGES.insurance_payer_id }, event);
@@ -1573,6 +1583,7 @@ exports.missingSessionCptCode = missingSessionCptCode;
 exports.missingDiagnosisCodes = missingDiagnosisCodes;
 exports.excessDiagnosisCodes = excessDiagnosisCodes;
 exports.missingPayerId = missingPayerId;
+exports.unresolvableInsuranceRecord = unresolvableInsuranceRecord;
 exports.evaluateSubmissionWarnings = evaluateSubmissionWarnings;
 exports.ageInYears = ageInYears;
 exports.REGENERATABLE_STATUSES = REGENERATABLE_STATUSES;

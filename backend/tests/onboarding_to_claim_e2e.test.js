@@ -840,6 +840,52 @@ test('missing payer id is blocked by the gate — 422, claim stays draft', async
   );
 });
 
+test('coverage hidden after the claim was created — 422, claim stays draft', async () => {
+  // The same stranding as the payer-id case, reached by a different route. Here
+  // the coverage was complete when the claim was created and is soft-deleted
+  // afterwards (staff correcting a duplicate insurance record). The claim still
+  // POINTS at it, so the id-only missing-insurance check passes; the load filters
+  // is_hidden so the record comes back null, and the payer-id check abstains on a
+  // null record. The claim then reached the builder with no coverage at all and
+  // threw locally — after the status transition, stranding a claim that was never
+  // transmitted. adapter.mode stays 'build_error' to prove the adapter is never
+  // reached now.
+  resetStore();
+  adapter.calls.length = 0;
+  adapter.mode = 'build_error';
+
+  const ids = await runChain();
+  const record = store.insurance_records[0];
+  assert.strictEqual(record.payer_id, '60054', 'the coverage was complete when the claim was created');
+  assert.strictEqual(claimRow(ids.claim.id).insurance_record_id, record.id,
+    'and the claim points at it');
+
+  // Staff soft-delete the record afterwards.
+  record.is_hidden = true;
+
+  // The projection stops calling the claim ready the moment its coverage vanishes.
+  const row = body(await listClaims()).claims.find((r) => r.id === ids.claim.id);
+  assert.strictEqual(row.readiness.state, 'needs_correction',
+    'a claim whose coverage vanished is not "ready"');
+  const blocker = row.readiness.blockers.find((b) => b.code === 'insurance_unresolvable');
+  assert.ok(blocker, 'the blocker names the vanished coverage');
+  assert.strictEqual(blocker.status, 422, 'reporting the status submit would answer');
+  // It does not misreport the cause: the payer id is unreadable, not missing.
+  assert.ok(!row.readiness.blockers.some((b) => b.code === 'insurance_payer_id'),
+    'and does not blame the payer id it can no longer read');
+
+  const res = await submitClaim(ids.claim.id);
+  assert.strictEqual(res.statusCode, 422, 'submit is refused with 422');
+  assert.match(body(res).error, /insurance record is no longer available/,
+    'and says what to fix, in plain English');
+  assert.strictEqual(adapter.calls.length, 0, 'the clearinghouse was never called');
+
+  const after = claimRow(ids.claim.id);
+  assert.strictEqual(after.status, 'draft', 'the claim stays draft');
+  assert.strictEqual(after.submitted_at, null, 'and was never marked submitted');
+  assert.strictEqual(after.control_number, null, 'and has no control number');
+});
+
 test('blocked 422 and stays draft — no billed amount, CPT, or diagnosis', async () => {
   // The billable content the claim actually charges for. A claim missing all
   // three once transmitted: it billed nothing, carried no procedure code, and

@@ -192,12 +192,32 @@ function excessDiagnosisCodes(session) {
 // Returns true when an attached record has no payer id.
 //
 // A NULL record is not this blocker's business — that is missingInsuranceRecord's
-// case (no coverage attached), and on the list projection it is also how a HIDDEN
-// insurance record presents, which the projection has always treated as absent.
+// case (no coverage attached), or unresolvableInsuranceRecord's (a named record
+// that cannot be loaded). Keeping this one narrow means each of the three answers
+// exactly one question, with a message that names the right fix.
 function missingPayerId(insurance) {
   if (!insurance) return false;
   const payerId = insurance.payer_id;
   return payerId == null || String(payerId).trim() === '';
+}
+
+// A claim can NAME an insurance record that no longer resolves: the record was
+// hidden (soft-deleted) after the claim was created, so the is_hidden-filtered
+// load returns null while claims.insurance_record_id still points at it.
+//
+// That case fell between two blockers. missingInsuranceRecord only inspects the
+// id, which is present; missingPayerId deliberately ignores a null record. So the
+// claim passed the whole gate, reached the builder with no coverage at all, and
+// threw locally on the absent payer id — AFTER the claim had already moved to
+// 'submitted'. That is the same stranding the content blockers exist to prevent,
+// reached by a different route, so it is blocked here too.
+//
+// Takes both halves because that is the only way to tell "no coverage named"
+// (missingInsuranceRecord's case, answered 400) from "coverage named but gone".
+// Returns true only for the latter.
+function unresolvableInsuranceRecord(claim, insurance) {
+  if (missingInsuranceRecord(claim)) return false;
+  return !insurance;
 }
 
 // --- blocker vocabulary ------------------------------------------------------
@@ -219,6 +239,8 @@ const BLOCKER_MESSAGES = {
   session_cpt_code: 'This claim has no CPT/procedure code — add it on the session.',
   claim_diagnosis_codes: 'This claim has no diagnosis code — add at least one on the session.',
   claim_diagnosis_limit: 'A claim can carry at most 12 diagnosis codes.',
+  insurance_unresolvable:
+    "This claim's insurance record is no longer available — attach the client's current coverage before submitting.",
   insurance_payer_id:
     "This client's insurance has no routable payer ID — re-run intake or set the payer on the insurance record.",
 };
@@ -244,6 +266,7 @@ const BLOCKER_STATUS = {
   session_cpt_code: 422,
   claim_diagnosis_codes: 422,
   claim_diagnosis_limit: 422,
+  insurance_unresolvable: 422,
   insurance_payer_id: 422,
 };
 
@@ -420,6 +443,13 @@ function evaluateClaimReadiness(ctx, asOf) {
   if (excessDiagnosisCodes(ctx && ctx.session) != null) {
     blockers.push(blocker('claim_diagnosis_limit', BLOCKER_MESSAGES.claim_diagnosis_limit));
   }
+  // Coverage that is NAMED but gone, then the payer id on coverage that resolved.
+  // Adjacent and in this order because an unresolvable record makes the payer-id
+  // question moot — and because either one, unblocked, reaches the same local
+  // build throw after the claim has already been marked submitted.
+  if (unresolvableInsuranceRecord(claim, ctx && ctx.insurance)) {
+    blockers.push(blocker('insurance_unresolvable', BLOCKER_MESSAGES.insurance_unresolvable));
+  }
   if (missingPayerId(ctx && ctx.insurance)) {
     blockers.push(blocker('insurance_payer_id', BLOCKER_MESSAGES.insurance_payer_id));
   }
@@ -451,6 +481,7 @@ module.exports = {
   missingDiagnosisCodes,
   excessDiagnosisCodes,
   missingPayerId,
+  unresolvableInsuranceRecord,
   // blocker vocabulary
   BLOCKER_MESSAGES,
   BLOCKER_STATUS,
