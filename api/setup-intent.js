@@ -13,6 +13,7 @@
 
 const stripe = require('../backend/lib/stripe');
 const { callLambda } = require('../backend/lib/lambda_api');
+const { isValidEmail } = require('../backend/lib/email');
 const { ALLOWED_ORIGINS, DEFAULT_ORIGIN } = require('../backend/lib/response');
 
 function applyCors(req, res) {
@@ -54,9 +55,23 @@ module.exports = async (req, res) => {
     // Create the Stripe Customer once, then reuse it on subsequent visits.
     let customerId = client.stripe_customer_id;
     if (!customerId) {
+      // Stripe rejects a malformed email outright ("Invalid email address: qujo"),
+      // which used to 500 the whole request and leave the patient staring at a
+      // generic "temporarily unavailable" page. The email is optional on a Stripe
+      // Customer and is not needed to capture a card, so a missing/garbage value
+      // is simply omitted — the card-setup link keeps working. Log the client id
+      // only (never the address itself: that is PHI) so it stays diagnosable.
+      const rawEmail = typeof client.email === 'string' ? client.email.trim() : '';
+      const email = isValidEmail(rawEmail) ? rawEmail : undefined;
+      if (!email) {
+        console.warn('setup_intent: client email missing or invalid; creating Stripe customer without it', {
+          client_id: client.client_id,
+        });
+      }
+
       const customer = await stripe.createCustomer({
         name: `${client.first_name || ''} ${client.last_name || ''}`.trim() || undefined,
-        email: client.email || undefined,
+        email,
         metadata: { client_id: client.client_id, practice_id: client.practice_id },
       });
       customerId = customer.id;
