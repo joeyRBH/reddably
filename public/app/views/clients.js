@@ -199,6 +199,8 @@
   }
 
   // Drop null / undefined / '' keys so optional fields are omitted, not blanked.
+  // CREATE only — on edit an omitted key means "leave as-is", which is the wrong
+  // reading of a field the user deliberately emptied (see buildClientPayload).
   function compact(obj) {
     var out = {};
     Object.keys(obj).forEach(function (k) {
@@ -206,6 +208,13 @@
       if (v === null || v === undefined || v === '') return;
       out[k] = v;
     });
+    return out;
+  }
+
+  // A plain copy — every key the form collected, nulls included.
+  function shallow(obj) {
+    var out = {};
+    Object.keys(obj).forEach(function (k) { out[k] = obj[k]; });
     return out;
   }
 
@@ -218,12 +227,23 @@
       .filter(Boolean);
   }
 
-  // Build the API payload for a client create/edit: compact the plain fields, then
-  // map the diagnosis picker's comma string to an array. On edit we always send
-  // diagnosis_codes (even empty) so clearing all codes persists; on create we omit
-  // it when empty. `isEdit` controls that.
+  // Build the API payload for a client create/edit, then map the diagnosis
+  // picker's comma string to an array. `isEdit` drives both halves:
+  //
+  //   create — compact the plain fields. A blank optional field on a brand-new
+  //     client has nothing to say, so omitting it keeps the POST body honest.
+  //   edit   — send EVERY field the form collected, nulls included. The backend
+  //     reads `col in body`, so an omitted key means "leave as-is" — exactly the
+  //     wrong reading of a field the user deliberately emptied. compact() dropping
+  //     those nulls is what silently discarded a cleared preferred_name, pronouns,
+  //     address_line2, email, phone, or date_of_birth: the PATCH succeeded, the
+  //     toast said "Client updated", and load() brought the old value straight
+  //     back. updateClient already maps a null to a NULL column for each of them.
+  //
+  // diagnosis_codes follows the same rule for the same reason — it was fixed
+  // field-by-field here first (`codes.length || isEdit`) before the general case.
   function buildClientPayload(values, isEdit) {
-    var payload = compact(values);
+    var payload = isEdit ? shallow(values) : compact(values);
     delete payload.diagnosis_codes;
     var codes = splitCodes(values.diagnosis_codes);
     if (codes.length || isEdit) payload.diagnosis_codes = codes;
