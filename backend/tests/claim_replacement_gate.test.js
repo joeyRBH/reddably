@@ -112,6 +112,10 @@ mock('lib/audit.js', { audit: async () => {}, sanitizeFields: (x) => x });
 
 const claimsLibSpy = { insertCalls: 0, lastInsertOpts: null };
 mock('lib/claims.js', {
+  // [] makes buildClaimContext fall back to the anchor session, so these cases
+  // stay exactly the single-service-line claims they were written to test.
+  loadClaimSessions: async () => [],
+  insertGroupedClaim: async () => ({}),
   primaryInsuranceForClient: async () => CTX.insurance_records,
   logClaimEvent: async () => {},
   logClaimAcknowledgment: async () => {},

@@ -164,6 +164,10 @@ mock('lib/claims.js', {
   logClaimAcknowledgment: async (q, a) => { if (a && a.payload != null) acks.push(a); },
   insertDraftClaim: async () => ({}),
   insertReplacementClaim: async () => ({}),
+  insertGroupedClaim: async () => ({}),
+  // [] makes buildClaimContext fall back to the anchor session, so these cases
+  // stay exactly the single-service-line claims they were written to test.
+  loadClaimSessions: async () => [],
   ensurePatientControlNumber: async (q, practiceId, claim) => {
     if (claim.patient_control_number) return claim.patient_control_number;
     const res = await q.query(

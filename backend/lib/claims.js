@@ -115,6 +115,93 @@ async function logClaimEvent(q, e) {
   );
 }
 
+// --- service lines (claim_sessions) ------------------------------------------
+
+// Attach one service line per session to a claim. `lines` is [{ session, charge }]
+// in filing order. Must run inside a transaction (`q` = pg client) so the claim
+// and its lines commit together — a claim with no lines would build an 837P with
+// no serviceLines at all and bill the payer nothing.
+async function insertClaimSessionLines(q, opts) {
+  const lines = opts.lines || [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    await q.query(
+      `insert into claim_sessions (practice_id, claim_id, session_id, line_charge, position)
+       values ($1, $2, $3, $4, $5)
+       on conflict (claim_id, session_id) do nothing`,
+      [opts.practiceId, opts.claimId, line.session_id, line.charge, i + 1]
+    );
+  }
+}
+
+// The sessions billed on a claim, in filing order, each joined to its own line
+// charge. Returns [] for a claim with no lines — callers decide whether that is
+// an error (the submit path) or simply a claim that predates the backfill.
+//
+// The line charge comes from claim_sessions, NOT from the session's current fee:
+// the charge that was filed must not drift because someone edited the session
+// afterwards, and the 837P requires the lines to sum to the claim charge.
+async function loadClaimSessions(q, practiceId, claimId) {
+  const res = await q.query(
+    `select s.*, cs.line_charge, cs.position
+       from claim_sessions cs
+       join sessions s on s.id = cs.session_id
+      where cs.claim_id = $1 and cs.practice_id = $2
+      order by cs.position asc`,
+    [claimId, practiceId]
+  );
+  return res.rows;
+}
+
+// Insert a GROUPED draft claim over several source claims, plus its 'created'
+// event, and return the claim row. Must run inside a transaction.
+//
+// The anchor (claims.session_id) is the FIRST session in filing order, so every
+// pre-existing join, readiness query and report keeps reading a real session.
+// billed_amount is the SUM of the line charges — which is what makes the single
+// platform fee come out right without touching claim_fee.js at all.
+//
+// The source claims are soft-deleted by the caller, not here: this function owns
+// creating the new claim, and the caller owns the decision to retire the old ones.
+async function insertGroupedClaim(q, opts) {
+  const lines = opts.lines || [];
+  const anchor = lines[0];
+  const ins = await q.query(
+    `insert into claims
+       (practice_id, session_id, client_id, clinician_id, insurance_record_id,
+        status, billed_amount)
+     values ($1, $2, $3, $4, $5, 'draft', $6)
+     returning *`,
+    [
+      opts.practiceId,
+      anchor.session_id,
+      opts.clientId,
+      opts.clinicianId,
+      opts.insuranceRecordId != null ? opts.insuranceRecordId : null,
+      opts.billedAmount,
+    ]
+  );
+  const claim = ins.rows[0];
+
+  await insertClaimSessionLines(q, {
+    practiceId: opts.practiceId,
+    claimId: claim.id,
+    lines,
+  });
+
+  await logClaimEvent(q, {
+    practiceId: opts.practiceId,
+    claimId: claim.id,
+    createdBy: opts.createdBy || null,
+    eventType: 'created',
+    statusTo: 'draft',
+    // Counts and short ids only — never a patient name, never a diagnosis.
+    note: 'Grouped claim created from ' + lines.length + ' draft claims (' +
+      lines.length + ' service lines).',
+  });
+  return claim;
+}
+
 // Insert a draft claim for a session plus its 'created' claim_events row, and
 // return the claim row. Must be called inside a transaction (`q` = pg client) so
 // the claim and its event commit together. Replicates POST /claims exactly.
@@ -137,6 +224,15 @@ async function insertDraftClaim(q, opts) {
     ]
   );
   const claim = ins.rows[0];
+  // A 1:1 claim is a grouped claim with one line. Writing the line here rather
+  // than special-casing it downstream is what keeps the 837P builder, the
+  // readiness projection and the detail view on ONE code path instead of
+  // branching on "grouped or not".
+  await insertClaimSessionLines(q, {
+    practiceId: opts.practiceId,
+    claimId: claim.id,
+    lines: [{ session_id: session.id, charge: opts.billedAmount != null ? opts.billedAmount : null }],
+  });
   await logClaimEvent(q, {
     practiceId: opts.practiceId,
     claimId: claim.id,
@@ -182,6 +278,25 @@ async function insertReplacementClaim(q, opts) {
     ]
   );
   const claim = ins.rows[0];
+  // COPY the original's service lines. A replacement must file the same services
+  // as the claim it supersedes — including every line of a grouped claim, not
+  // just the anchor session. Copying (rather than referencing) keeps the original
+  // untouched, matching how the billable fields above are copied.
+  const originalLines = await q.query(
+    `select session_id, line_charge from claim_sessions
+      where claim_id = $1 and practice_id = $2 order by position asc`,
+    [original.id, opts.practiceId]
+  );
+  await insertClaimSessionLines(q, {
+    practiceId: opts.practiceId,
+    claimId: claim.id,
+    lines: originalLines.rows.length
+      ? originalLines.rows.map((r) => ({ session_id: r.session_id, charge: r.line_charge }))
+      // A claim created before migration 022's backfill, or one whose lines were
+      // somehow lost: fall back to the anchor session so the replacement still
+      // bills something rather than filing an empty claim.
+      : [{ session_id: original.session_id, charge: original.billed_amount }],
+  });
   await logClaimEvent(q, {
     practiceId: opts.practiceId,
     claimId: claim.id,
@@ -204,4 +319,7 @@ module.exports = {
   logClaimAcknowledgment,
   insertDraftClaim,
   insertReplacementClaim,
+  insertClaimSessionLines,
+  insertGroupedClaim,
+  loadClaimSessions,
 };

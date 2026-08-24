@@ -10,6 +10,9 @@
 //   GET    /claims/{id}            → one claim, practice-scoped
 //   PATCH  /claims/{id}            → edit a DRAFT claim's billable fields
 //   DELETE /claims/{id}            → soft-delete (draft/void only)
+//   POST   /claims/group           → fold several draft claims for one client into
+//                                    ONE multi-line claim (money-path; one fee)
+//   POST   /claims/{id}/ungroup    → split a grouped draft back into one per line
 //   POST   /claims/{id}/submit     → submit via the clearinghouse adapter
 //   POST   /claims/{id}/refresh    → poll the clearinghouse for status + amounts
 //   POST   /claims/{id}/reconcile  → resolve an unconfirmed submission attempt
@@ -34,8 +37,15 @@ const {
   logClaimAcknowledgment: logAck,
   insertDraftClaim,
   insertReplacementClaim,
+  insertGroupedClaim,
+  loadClaimSessions,
   ensurePatientControlNumber,
 } = require('../lib/claims');
+// Which draft claims may be folded into one multi-line 837P, and why not.
+// MONEY-PATH: a grouped claim is one filing and one platform fee covering
+// several dates of service. Pure rules, evaluated here authoritatively and
+// mirrored by the UI only to decide whether to OFFER the action.
+const { evaluateGroup, orderForFiling, MAX_GROUPED_LINES } = require('../lib/claim_grouping');
 // Every PURE pre-submission rule lives in lib/claim_readiness.js — one
 // implementation shared by this submit path and the readiness projection on
 // GET /claims, so the list can never disagree with the gate. See that module's
@@ -147,6 +157,29 @@ function subAction(event) {
   return m ? m[1].toLowerCase() : null;
 }
 
+// COLLECTION-level actions: /claims/<action>, with no {id}. Only 'group' today.
+//
+// subAction() above deliberately only matches /claims/{id}/<action>, so without
+// this the path /claims/group falls through to POST /claims and is handled as
+// "create a claim" — silently, with a body that has no session_id. Read from the
+// routeKey template first (stable), then the raw path.
+//
+// The allow-list is what keeps this safe: a real claim id can never be mistaken
+// for an action, because 'group' is not a UUID and nothing else is accepted.
+const COLLECTION_ACTIONS = ['group'];
+
+function collectionAction(event) {
+  const rk = (event && event.requestContext && event.requestContext.routeKey) || '';
+  const path =
+    (event && event.requestContext && event.requestContext.http && event.requestContext.http.path) ||
+    (event && event.rawPath) || '';
+  for (const name of COLLECTION_ACTIONS) {
+    const re = new RegExp('/claims/' + name + '/?$', 'i');
+    if (re.test(rk) || re.test(path)) return name;
+  }
+  return null;
+}
+
 // --- validation helpers ------------------------------------------------------
 
 function cleanText(v) {
@@ -236,6 +269,10 @@ function shapeClaimRow(r) {
   base.cpt_code = r.session_cpt_code || null;
   base.diagnosis_codes = Array.isArray(r.session_diagnosis_codes) ? r.session_diagnosis_codes : null;
   base.place_of_service = r.session_place_of_service || null;
+  // How many service lines this claim files. Comes from a LEFT JOIN count in the
+  // list query, so a claim predating migration 022's backfill reports 1 rather
+  // than 0 — it does file one line, it just has no row saying so yet.
+  base.line_count = Number(r.line_count) > 0 ? Number(r.line_count) : 1;
   base.readiness = base.status === 'draft' ? evaluateClaimReadiness(readinessContext(r)) : null;
   return base;
 }
@@ -431,9 +468,18 @@ async function buildClaimContext(practiceId, claim) {
     }
   }
 
+  // Every session billed on this claim, in filing order — one 837P service line
+  // each. ctx.session stays the ANCHOR (claims.session_id) because the claim-LEVEL
+  // fields the builder reads from it (place of service, the diagnosis set) are
+  // single-valued on an 837P. A claim predating migration 022's backfill would
+  // load no lines, so fall back to the anchor rather than building an empty claim.
+  const lines = await loadClaimSessions(db, practiceId, claim.id);
+  const anchor = sessionRes.rows[0] || null;
+
   return {
     claim,
-    session: sessionRes.rows[0] || null,
+    sessions: lines.length ? lines : (anchor ? [anchor] : []),
+    session: anchor,
     client: clientRes.rows[0] || null,
     clinician: clinicianRes.rows[0] || null,
     practice: practiceRes.rows[0] || null,
@@ -560,7 +606,11 @@ async function listClaims(practiceId, event, authCtx) {
             pr.address_line1  as practice_address_line1,
             pr.city           as practice_city,
             pr.state          as practice_state,
-            pr.postal_code    as practice_postal_code
+            pr.postal_code    as practice_postal_code,
+            -- How many service lines this claim files. A correlated subquery
+            -- rather than a join + group by, so adding it cannot change the
+            -- row count of a query the whole workspace depends on.
+            (select count(*) from claim_sessions cs where cs.claim_id = c.id) as line_count
        from claims c
        join clients cl  on cl.id = c.client_id
        join sessions s  on s.id = c.session_id
@@ -578,6 +628,23 @@ async function listClaims(practiceId, event, authCtx) {
   return json(200, { claims: res.rows.map(shapeClaimRow) }, event);
 }
 
+// Shape the service lines for the claim detail. Dates, codes and per-line
+// charges — the columns of CMS-1500 Box 24. `is_anchor` marks the line whose
+// session is claims.session_id, which is the one every legacy join reads.
+function shapeClaimLines(rows, claim) {
+  return (rows || []).map((r) => ({
+    session_id: r.id,
+    position: r.position,
+    session_date: r.session_date,
+    cpt_code: r.cpt_code,
+    place_of_service: r.place_of_service,
+    procedure_modifiers: r.procedure_modifiers,
+    diagnosis_codes: r.diagnosis_codes,
+    line_charge: r.line_charge,
+    is_anchor: !!claim && r.id === claim.session_id,
+  }));
+}
+
 async function getClaim(practiceId, id, event, authCtx) {
   if (!isUUID(id)) return json(404, { error: 'Not found' }, event);
   const row = await loadClaimDetail(practiceId, id);
@@ -587,7 +654,13 @@ async function getClaim(practiceId, id, event, authCtx) {
     resourceType: 'claim',
     resourceId: id,
   });
-  return json(200, { claim: shapeClaimDetail(row) }, event);
+  const detail = shapeClaimDetail(row);
+  // The claim's service lines (CMS-1500 Box 24). ADDITIVE: every pre-existing
+  // field on the detail response is untouched. A single-line claim reports one
+  // line, so the view never has to branch on "grouped or not".
+  const lineRows = await loadClaimSessions(db, practiceId, id);
+  detail.service_lines = shapeClaimLines(lineRows, row);
+  return json(200, { claim: detail }, event);
 }
 
 async function updateClaim(practiceId, id, body, event, authCtx) {
@@ -747,9 +820,18 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   // door (837P 2300/CLM-05-01). HARD block, not a soft warning: no confirmation
   // makes an invalid code transmittable. An EMPTY value stays submittable — the
   // adapter defaults it to 11 (office).
-  const sessionPlaceOfService = invalidSessionPlaceOfService(ctx.session);
-  if (sessionPlaceOfService != null) {
-    return json(422, { error: placeOfServiceBlockerMessage() }, event);
+  // Validated across EVERY service line, not just the anchor: a grouped claim
+  // whose second date of service carries an invalid place of service is exactly
+  // as unfilable as one whose first does, and the payer would be the one to say
+  // so. lineOf() names the offending date when there is more than one line.
+  const lines = ctx.sessions || [];
+  const lineOf = (session) => (lines.length > 1 && session && session.session_date
+    ? ` (service date ${String(session.session_date).slice(0, 10)})`
+    : '');
+  for (const line of lines) {
+    if (invalidSessionPlaceOfService(line) != null) {
+      return json(422, { error: placeOfServiceBlockerMessage() + lineOf(line) }, event);
+    }
   }
 
   // Billable CONTENT — the charge, the procedure code, the diagnoses and the
@@ -765,14 +847,16 @@ async function submitClaim(practiceId, userId, id, body, event, authCtx) {
   if (missingBilledAmount(claim)) {
     return json(422, { error: BLOCKER_MESSAGES.claim_billed_amount }, event);
   }
-  if (missingSessionCptCode(ctx.session)) {
-    return json(422, { error: BLOCKER_MESSAGES.session_cpt_code }, event);
-  }
-  if (missingDiagnosisCodes(ctx.session)) {
-    return json(422, { error: BLOCKER_MESSAGES.claim_diagnosis_codes }, event);
-  }
-  if (excessDiagnosisCodes(ctx.session) != null) {
-    return json(422, { error: BLOCKER_MESSAGES.claim_diagnosis_limit }, event);
+  for (const line of lines) {
+    if (missingSessionCptCode(line)) {
+      return json(422, { error: BLOCKER_MESSAGES.session_cpt_code + lineOf(line) }, event);
+    }
+    if (missingDiagnosisCodes(line)) {
+      return json(422, { error: BLOCKER_MESSAGES.claim_diagnosis_codes + lineOf(line) }, event);
+    }
+    if (excessDiagnosisCodes(line) != null) {
+      return json(422, { error: BLOCKER_MESSAGES.claim_diagnosis_limit + lineOf(line) }, event);
+    }
   }
   // Coverage the claim NAMES but that no longer loads (the record was hidden
   // after the claim was created). missingInsuranceRecord above only saw the id,
@@ -1517,12 +1601,33 @@ async function regenerateClaim(practiceId, userId, id, event, authCtx) {
     return json(409, { error: 'Only draft or denied claims can be regenerated from their session.' }, event);
   }
 
-  const session = await loadSession(practiceId, claim.session_id);
-  if (!session) {
-    return json(409, { error: 'The claim\'s session no longer exists.' }, event);
+  // Regenerate from EVERY session the claim bills, not just the anchor.
+  //
+  // This read the anchor session's fee alone and made it the whole claim charge.
+  // On a grouped claim that is a money bug, not a cosmetic one: a six-line claim
+  // would collapse to one session's fee, under-billing the payer and (because
+  // the platform fee is 5% of billed_amount) under-charging the patient — and it
+  // is reachable from the ordinary "Save & regenerate" on the Edit claim form.
+  //
+  // Each line's charge is resynced from its own session's CURRENT fee, and the
+  // claim charge becomes their sum, so the line-sum invariant the 837P builder
+  // asserts still holds afterwards.
+  const lines = await loadClaimSessions(db, practiceId, claim.id);
+  if (!lines.length) {
+    const anchor = await loadSession(practiceId, claim.session_id);
+    if (!anchor) {
+      return json(409, { error: 'The claim\'s session no longer exists.' }, event);
+    }
+    lines.push(Object.assign({}, anchor, { line_charge: anchor.fee, position: 1 }));
   }
 
-  const billedAmount = session.fee != null ? session.fee : null;
+  const charges = lines.map((line) => (line.fee != null ? Number(line.fee) : null));
+  const billedAmount = charges.every((c) => c == null)
+    ? null
+    // Rounded to cents: summing numeric values through JS floats can land on
+    // 449.99999999999994, and the claim charge must equal the sum of the line
+    // charges EXACTLY or the payer rejects the filing.
+    : Math.round(charges.reduce((sum, c) => sum + (c == null ? 0 : c), 0) * 100) / 100;
 
   const updated = await db.withTransaction(async (client) => {
     const res = await client.query(
@@ -1533,12 +1638,23 @@ async function regenerateClaim(practiceId, userId, id, event, authCtx) {
     );
     if (res.rowCount === 0) return null;
     const row = res.rows[0];
+    // Resync the stored line charges in the SAME transaction, so the claim total
+    // and its lines can never be left disagreeing.
+    for (const line of lines) {
+      await client.query(
+        `update claim_sessions set line_charge = $1
+          where claim_id = $2 and session_id = $3 and practice_id = $4`,
+        [line.fee != null ? line.fee : null, row.id, line.id, practiceId]
+      );
+    }
     await logEvent(client, {
       practiceId,
       claimId: row.id,
       createdBy: userId,
       eventType: 'note',
-      note: 'Claim fields regenerated from the updated session.',
+      note: lines.length > 1
+        ? 'Claim fields regenerated from its ' + lines.length + ' sessions.'
+        : 'Claim fields regenerated from the updated session.',
     });
     return row;
   });
@@ -1550,6 +1666,206 @@ async function regenerateClaim(practiceId, userId, id, event, authCtx) {
     resourceId: id,
   });
   return json(200, { claim: shapeClaim(updated) }, event);
+}
+
+// POST /claims/group  { claim_ids: [...] }
+// -----------------------------------------------------------------------------
+// MONEY-PATH. Fold several draft claims for ONE client into a single 837P
+// carrying one service line per session — what a CMS-1500 has always been able
+// to do (Box 24 holds six dated lines).
+//
+// Why this exists: a client with ten sessions in a month produced ten claims and
+// ten separate off-session Stripe charges for the 5% platform fee, so their card
+// statement showed ten line items for what is, to them, one month of therapy.
+//
+// The fee is NOT touched here and needs no change. claim_fee.js charges 5% of
+// claims.billed_amount; a grouped claim's billed_amount is the SUM of its line
+// charges. Same total dollars, one charge. The one deliberate consequence is
+// that a fee is charged when the GROUPED claim is submitted — the source drafts
+// are retired unsubmitted, so they never charged anything.
+//
+// Eligibility is evaluated HERE authoritatively (lib/claim_grouping.js). The UI
+// runs the same pure rules to decide whether to offer the button; a client that
+// is out of date, or a direct API caller, still cannot group claims that must not
+// be grouped.
+async function groupClaims(practiceId, userId, body, event, authCtx) {
+  const ids = Array.isArray(body && body.claim_ids) ? body.claim_ids : null;
+  if (!ids || !ids.length) {
+    return json(400, { error: 'Missing required field: claim_ids.' }, event);
+  }
+  if (ids.some((id) => !isUUID(id))) {
+    return json(400, { error: 'claim_ids must all be claim ids.' }, event);
+  }
+  // De-duplicate before anything else: the same claim ticked twice must not
+  // become two service lines billing the payer for one session twice.
+  const unique = [];
+  const seen = Object.create(null);
+  ids.forEach((id) => { if (!seen[id]) { seen[id] = true; unique.push(id); } });
+  if (unique.length > MAX_GROUPED_LINES) {
+    return json(422, {
+      error: `A claim form holds ${MAX_GROUPED_LINES} service lines; you selected ${unique.length}.`,
+      conflicts: [{ code: 'too_many', message: 'Group them in smaller batches.' }],
+    }, event);
+  }
+
+  // Load them practice-scoped, with the session fields the rules compare.
+  const res = await db.query(
+    `select c.*, s.session_date, s.cpt_code, s.place_of_service,
+            s.diagnosis_codes as session_diagnosis_codes
+       from claims c
+       join sessions s on s.id = c.session_id
+      where c.practice_id = $1 and c.is_hidden = false and c.id = any($2::uuid[])`,
+    [practiceId, unique]
+  );
+  if (res.rowCount !== unique.length) {
+    // A missing id is indistinguishable from another practice's claim, by design.
+    return json(404, { error: 'Not found' }, event);
+  }
+
+  const candidates = res.rows.map((r) => Object.assign({}, r, {
+    diagnosis_codes: r.session_diagnosis_codes,
+  }));
+  const verdict = evaluateGroup(candidates);
+  if (!verdict.ok) {
+    return json(422, {
+      error: verdict.conflicts[0].message,
+      conflicts: verdict.conflicts,
+    }, event);
+  }
+
+  const ordered = orderForFiling(candidates);
+  const first = ordered[0];
+
+  const grouped = await db.withTransaction(async (client) => {
+    // Re-assert the source claims are still draft INSIDE the transaction, and
+    // retire them in the same statement that checks. A concurrent submit of one
+    // of them would otherwise be folded into a group after it had already been
+    // filed. Zero rows updated means something changed underneath us.
+    const retire = await client.query(
+      `update claims
+          set is_hidden = true
+        where practice_id = $1 and is_hidden = false and status = 'draft'
+          and control_number is null and submitted_at is null
+          and id = any($2::uuid[])
+        returning id`,
+      [practiceId, ordered.map((c) => c.id)]
+    );
+    if (retire.rowCount !== ordered.length) return null;
+
+    const created = await insertGroupedClaim(client, {
+      practiceId,
+      clientId: first.client_id,
+      clinicianId: first.clinician_id,
+      insuranceRecordId: first.insurance_record_id,
+      billedAmount: verdict.total,
+      createdBy: userId,
+      lines: ordered.map((c) => ({ session_id: c.session_id, charge: c.billed_amount })),
+    });
+
+    // Leave a trail on each retired claim pointing at its successor, so a claim
+    // that vanishes from the queue can be explained. Short id only — no PHI.
+    for (const source of ordered) {
+      await logEvent(client, {
+        practiceId,
+        claimId: source.id,
+        createdBy: userId,
+        eventType: 'note',
+        note: 'Grouped into claim #' + String(created.id).slice(0, 8) +
+          ' and retired unsubmitted; it was never filed and never charged a fee.',
+      });
+    }
+    return created;
+  });
+
+  if (!grouped) {
+    return json(409, {
+      error: 'One of these claims changed while grouping — it may have just been submitted or deleted. Reload and try again.',
+    }, event);
+  }
+
+  await audit(event, authCtx, {
+    action: 'claim.group',
+    resourceType: 'claim',
+    resourceId: grouped.id,
+    // Counts and ids only — never an amount, never a patient.
+    metadata: { lines: ordered.length, source_claim_ids: ordered.map((c) => c.id) },
+  });
+  return json(201, { claim: shapeClaim(grouped) }, event);
+}
+
+// POST /claims/{id}/ungroup
+// -----------------------------------------------------------------------------
+// Split a grouped DRAFT back into one claim per service line and retire the
+// group. Draft-only and multi-line-only: once a grouped claim has been filed it
+// is what the payer holds, and splitting it locally would leave our records
+// describing a filing that does not exist.
+//
+// The rebuilt claims are ordinary drafts, so each will charge its own fee if
+// submitted individually — which is the honest consequence of choosing to file
+// them separately, and the reason the confirm dialog says so.
+async function ungroupClaim(practiceId, userId, id, event, authCtx) {
+  if (!isUUID(id)) return json(404, { error: 'Not found' }, event);
+  const claim = await loadClaim(practiceId, id);
+  if (!claim) return json(404, { error: 'Not found' }, event);
+  if (claim.status !== 'draft') {
+    return json(409, { error: 'Only draft claims can be ungrouped.' }, event);
+  }
+  if (claim.control_number != null || claim.submitted_at != null) {
+    return json(409, {
+      error: 'This claim has already been sent to the clearinghouse once and cannot be ungrouped. Reconcile it first.',
+    }, event);
+  }
+
+  const lines = await loadClaimSessions(db, practiceId, claim.id);
+  if (lines.length < 2) {
+    return json(409, { error: 'This claim has a single service line — there is nothing to ungroup.' }, event);
+  }
+
+  const rebuilt = await db.withTransaction(async (client) => {
+    const gone = await client.query(
+      `update claims set is_hidden = true
+        where id = $1 and practice_id = $2 and is_hidden = false and status = 'draft'
+          and control_number is null and submitted_at is null
+        returning id`,
+      [claim.id, practiceId]
+    );
+    if (gone.rowCount === 0) return null;
+
+    const out = [];
+    for (const line of lines) {
+      const created = await insertDraftClaim(client, {
+        practiceId,
+        session: line,
+        insuranceRecordId: claim.insurance_record_id,
+        // The line's OWN filed charge, not the group total — splitting must not
+        // multiply what the payer is billed.
+        billedAmount: line.line_charge != null ? line.line_charge : line.fee,
+        createdBy: userId,
+        note: 'Split out of grouped claim #' + String(claim.id).slice(0, 8) + '.',
+      });
+      out.push(created);
+    }
+    await logEvent(client, {
+      practiceId,
+      claimId: claim.id,
+      createdBy: userId,
+      eventType: 'note',
+      note: 'Ungrouped into ' + out.length + ' separate draft claims and retired unsubmitted.',
+    });
+    return out;
+  });
+
+  if (!rebuilt) {
+    return json(409, { error: 'This claim changed while ungrouping. Reload and try again.' }, event);
+  }
+
+  await audit(event, authCtx, {
+    action: 'claim.ungroup',
+    resourceType: 'claim',
+    resourceId: claim.id,
+    metadata: { lines: rebuilt.length, claim_ids: rebuilt.map((c) => c.id) },
+  });
+  return json(200, { claims: rebuilt.map(shapeClaim) }, event);
 }
 
 async function listEvents(practiceId, id, event) {
@@ -1629,6 +1945,14 @@ exports.handler = async (event) => {
     if (action === 'void' && method === 'POST' && id) return await voidClaim(practiceId, userId, id, event, authCtx);
     if (action === 'regenerate' && method === 'POST' && id) return await regenerateClaim(practiceId, userId, id, event, authCtx);
     if (action === 'events' && method === 'GET' && id) return await listEvents(practiceId, id, event);
+    if (action === 'ungroup' && method === 'POST' && id) return await ungroupClaim(practiceId, userId, id, event, authCtx);
+
+    // /claims/group acts on a SET of claims named in the body, so it has no {id}.
+    // Matched from the path (see collectionAction) and checked BEFORE the bare
+    // POST /claims, which would otherwise swallow it as a create.
+    if (collectionAction(event) === 'group' && method === 'POST') {
+      return await groupClaims(practiceId, userId, body, event, authCtx);
+    }
 
     if (method === 'POST' && !id) return await createClaim(practiceId, userId, body, event, authCtx);
     if (method === 'GET' && !id) return await listClaims(practiceId, event, authCtx);

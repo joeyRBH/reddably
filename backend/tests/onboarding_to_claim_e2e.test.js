@@ -111,6 +111,7 @@ function resetStore(overrides) {
     sessions: [],
     claims: [],
     claim_events: [],
+    claim_sessions: [],
     claim_acknowledgments: [],
   };
 }
@@ -210,6 +211,18 @@ function routeSelect(q, sql, params) {
   if (/from provider_billing_profiles/.test(q)) return none();
 
   // --- claims ---
+  // The claim's service lines, joined to their sessions, in filing order.
+  if (/^select s\.\*, cs\.line_charge, cs\.position from claim_sessions/.test(q)) {
+    const lines = store.claim_sessions
+      .filter((r) => r.claim_id === params[0] && r.practice_id === params[1])
+      .sort((a, b) => a.position - b.position)
+      .map((r) => {
+        const sess = store.sessions.find((x) => x.id === r.session_id);
+        return Object.assign({}, sess, { line_charge: r.line_charge, position: r.position });
+      });
+    return { rows: lines, rowCount: lines.length };
+  }
+
   if (/^select 1 from claims where session_id = \$1 and practice_id = \$2/.test(q)) {
     const c = store.claims.find((r) => r.session_id === params[0] && r.practice_id === params[1] && !r.is_hidden);
     return one(c ? { '?column?': 1 } : null);
@@ -338,6 +351,24 @@ function routeInsert(q, sql, params) {
       submitted_at: null,
       is_hidden: false,
     }));
+  }
+
+  // Service lines. Every claim gets at least one — a 1:1 claim is a grouped
+  // claim with a single line — so the 837P builder has one code path.
+  if (/^insert into claim_sessions/.test(q)) {
+    const exists = store.claim_sessions.some(
+      (r) => r.claim_id === params[1] && r.session_id === params[2]
+    );
+    if (!exists) {
+      insertRow('claim_sessions', {
+        practice_id: params[0],
+        claim_id: params[1],
+        session_id: params[2],
+        line_charge: params[3],
+        position: params[4],
+      });
+    }
+    return none();
   }
 
   if (/^insert into claim_events/.test(q)) {
