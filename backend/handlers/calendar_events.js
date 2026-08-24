@@ -27,6 +27,7 @@ const { requireAuth } = require('../lib/auth');
 const { json, preflight } = require('../lib/response');
 const { parseBody } = require('../lib/util');
 const { audit } = require('../lib/audit');
+const { applyClientDefaults } = require('../lib/billing_fields');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -241,10 +242,11 @@ async function promoteEvent(practiceId, id, body, event, authCtx) {
       };
     }
 
-    // The client must belong to the caller's practice. Their default diagnosis
-    // codes carry onto the session (per-session override stays possible later).
+    // The client must belong to the caller's practice. Their billing DEFAULTS
+    // carry onto the session (per-session override stays possible later), so the
+    // whole row is selected rather than a projection.
     const cliRes = await tx.query(
-      `select id, diagnosis_codes from clients
+      `select * from clients
         where id = $1 and practice_id = $2 and is_hidden = false
         limit 1`,
       [clientId, practiceId]
@@ -254,15 +256,27 @@ async function promoteEvent(practiceId, id, body, event, authCtx) {
       return { status: 400, body: { error: 'client_id is not a client in this practice.' } };
     }
 
-    // A calendar event carries appointment facts, not billing data: cpt_code,
-    // place_of_service, fee, and procedure_modifiers stay NULL for staff to
-    // fill in before the claim.
+    // A calendar event still carries appointment facts, not billing data — but
+    // the CLIENT carries billing defaults, and those seed the session here. This
+    // is what makes "the clinician just verifies the appointment" true: the
+    // promoted session arrives with a CPT code, place of service, fee, modifiers
+    // and diagnosis already on it, instead of four NULLs that had to be typed in
+    // by hand before the session could become a submittable claim.
+    //
+    // A client with no defaults set behaves exactly as before (all NULL) — the
+    // seeding only ever fills a blank, never overwrites.
+    //
+    // The event itself is still never trusted to supply billing data, and a name
+    // match still never promotes anything on its own: this runs only after an
+    // explicit human confirmation upstream.
+    const billing = applyClientDefaults({}, client);
     const sessionDate = sessionDateInZone(ev.starts_at, ev.calendar_time_zone);
     const insRes = await tx.query(
       `insert into sessions
          (practice_id, client_id, clinician_id, session_date, duration_minutes,
-          diagnosis_codes, status, source)
-       values ($1, $2, $3, $4, $5, $6, 'scheduled', 'calendar')
+          diagnosis_codes, cpt_code, place_of_service, procedure_modifiers, fee,
+          status, source)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'scheduled', 'calendar')
        returning *`,
       [
         ev.practice_id,
@@ -270,7 +284,11 @@ async function promoteEvent(practiceId, id, body, event, authCtx) {
         ev.clinician_id,
         sessionDate,
         ev.duration_minutes,
-        client.diagnosis_codes || null,
+        billing.diagnosis_codes || null,
+        billing.cpt_code || null,
+        billing.place_of_service || null,
+        billing.procedure_modifiers || null,
+        billing.fee != null ? billing.fee : null,
       ]
     );
     const session = insRes.rows[0];

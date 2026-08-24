@@ -73,7 +73,9 @@ async function stubQuery(text, params) {
     return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
   }
 
-  if (/select id, diagnosis_codes from clients/.test(t)) {
+  // Promotion now selects the whole client row: the session is seeded from
+  // that client's billing defaults, not just their diagnosis codes.
+  if (/select \* from clients/.test(t)) {
     const row = state.clients.find(
       (r) => r.id === params[0] && r.practice_id === params[1] && !r.is_hidden
     );

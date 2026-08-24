@@ -64,7 +64,13 @@ const fakeDb = {
     if (/select\s+practice_id\s+from\s+users/i.test(sql)) {
       return { rows: [{ practice_id: 'practice-1' }], rowCount: 1 };
     }
-    if (/select\s+1\s+from\s+clients/i.test(sql)) return { rows: [{ '?column?': 1 }], rowCount: 1 };
+    // clientInPractice now selects the whole client row (it seeds a new
+    // session from that client's billing defaults). Every default is NULL
+    // here on purpose: these cases are about what the REQUEST supplies, so
+    // the client must contribute nothing.
+    if (/select\s+\*\s+from\s+clients/i.test(sql)) {
+      return { rows: [{ id: 'client-1', practice_id: 'practice-1' }], rowCount: 1 };
+    }
     if (/select\s+1\s+from\s+users/i.test(sql)) return { rows: [{ '?column?': 1 }], rowCount: 1 };
     if (/insert\s+into\s+sessions/i.test(sql)) {
       lastInsertParams = params;
