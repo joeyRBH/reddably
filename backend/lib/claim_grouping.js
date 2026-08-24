@@ -10,10 +10,13 @@
 // under the wrong rendering provider, against the wrong policy, or with a
 // diagnosis that does not belong to them.
 //
-// Pure: no DB, no HTTP, no logging. Every rule is a function of the claim rows
-// the list endpoint already returns, so the UI can evaluate the same rules to
-// decide whether to offer the action, and the server re-evaluates them
-// authoritatively before writing anything.
+// Pure: no DB, no HTTP, no logging. THIS MODULE IS THE SOLE AUTHORITY. The
+// browser deliberately does not carry a copy — it offers the action for any
+// two-or-more selection and renders whatever conflicts come back. A client-side
+// copy would be a second, silently divergent definition of what may be filed
+// together on one claim, and the divergence would surface as a wrongly-FILED
+// claim rather than a broken button. claim_grouping.test.js asserts the rule
+// vocabulary is absent from views/claims.js.
 //
 // PHI: `reason` strings name FIELDS and DATES OF SERVICE, never patient names,
 // member ids or diagnosis values. They are shown to authenticated practice staff
@@ -25,6 +28,19 @@
 // practical ceiling and the one we enforce.
 const MAX_GROUPED_LINES = 6;
 
+// The COMPATIBILITY CONTRACT for grouping is five things, not four:
+//
+//   client · rendering clinician · insurance policy · place of service
+//   · normalized diagnosis SET
+//
+// The first four are simple equality and live in the list below. The fifth is
+// enforced immediately after it in evaluateGroup(), separately ONLY because it
+// compares as a normalized set rather than by equality. Reading this constant as
+// "the whole must-match set" is a mistake: diagnoses are just as mandatory.
+//
+// CPT, fee and procedure modifiers are deliberately NOT here. Each rides its own
+// 837P service line, so they may differ freely across a group.
+//
 // Fields that must be IDENTICAL across every claim in a group, because the 837P
 // carries exactly one of each at the CLAIM level — not per service line. Putting
 // two different values into one claim does not split it; it silently files both
@@ -146,11 +162,24 @@ function evaluateGroup(claims) {
     }
   });
 
-  if (rows.some((c) => !sameDiagnoses(c.diagnosis_codes, first.diagnosis_codes))) {
+  // Diagnosis-set equality is a MUST-MATCH rule exactly like the four fields
+  // above, and for the same reason — the 837P emits ONE diagnosis set at claim
+  // level and every service line points into that shared list. It is checked
+  // separately only because it compares as a normalized SET rather than by
+  // equality (order, case and padding are not meaningful).
+  //
+  // The message names the offending DATES OF SERVICE, because the fix is not on
+  // the claim at all: the clinician has to correct the diagnosis on those
+  // sessions. Dates only — never the codes themselves, and never a patient.
+  const dxMismatched = rows.filter((c) => !sameDiagnoses(c.diagnosis_codes, first.diagnosis_codes));
+  if (dxMismatched.length) {
     add('mixed_diagnoses',
-      'These claims do not carry the same diagnosis codes. Diagnoses sit on the claim, not the ' +
-      'service line, so grouping them would file every session under one session\'s diagnoses. ' +
-      'Make them match on the sessions first, or file these separately.');
+      'These claims do not carry the same diagnosis codes — ' +
+      dxMismatched.map(dateOf).join(', ') + ' ' +
+      (dxMismatched.length === 1 ? 'differs' : 'differ') + ' from ' + dateOf(first) + '. ' +
+      'Diagnoses sit on the claim, not the service line, so grouping them would file every ' +
+      'session under one session\'s diagnoses. Correct the diagnosis on those sessions first, ' +
+      'or file these separately.');
   }
 
   // --- the same session must not appear twice --------------------------------

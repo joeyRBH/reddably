@@ -226,12 +226,63 @@ test('CPT, fee and modifiers are SERVICE-LINE attributes and may differ', () => 
   assert.strictEqual(r.total, 375, 'different charges simply sum');
 });
 
-test('the must-match set is exactly the claim-level fields, and no more', () => {
-  // A guard against the set quietly growing: adding a field here means claims
-  // that could legitimately be filed together stop being groupable.
+test('the compatibility contract is FIVE things: the four fields PLUS the diagnosis set', () => {
+  // CLAIM_LEVEL_FIELDS is only the simple-equality half. Reading it as the whole
+  // must-match set is a mistake that would quietly drop diagnosis compatibility,
+  // so both halves are asserted here together.
   assert.deepStrictEqual(G.CLAIM_LEVEL_FIELDS.map((f) => f.key).sort(),
     ['client_id', 'clinician_id', 'insurance_record_id', 'place_of_service'],
-    'client, rendering clinician, policy, place of service — plus the diagnosis set');
+    'the simple-equality half');
+
+  // The fifth rule, asserted behaviourally rather than by inspecting a constant:
+  // identical in every one of the four fields, differing ONLY in diagnoses.
+  const dxOnly = G.evaluateGroup(pair({}, { diagnosis_codes: ['F321'] }));
+  assert.strictEqual(dxOnly.ok, false,
+    'diagnosis-set equality is mandatory, exactly like the four fields');
+  assert.deepStrictEqual(codes(dxOnly), ['mixed_diagnoses'],
+    'and it is the ONLY thing wrong with that selection');
+
+  // And the three that must NOT be in the contract, asserted the same way.
+  const lineAttrsOnly = G.evaluateGroup(pair(
+    { cpt_code: '90791', billed_amount: 250, procedure_modifiers: ['95'] },
+    { cpt_code: '90834', billed_amount: 125, procedure_modifiers: null }
+  ));
+  assert.strictEqual(lineAttrsOnly.ok, true,
+    'CPT, fee and modifiers ride their own service lines and must not block grouping');
+});
+
+// --- the diagnosis-mismatch refusal, end to end ------------------------------
+
+test('a diagnosis mismatch names the offending DATES so the session can be fixed', () => {
+  // The fix is not on the claim: the clinician has to correct the diagnosis on
+  // the underlying session, so the message has to say which one.
+  const r = G.evaluateGroup([
+    claim({ id: 'c1', session_id: 's1', session_date: '2026-08-03', diagnosis_codes: ['F411'] }),
+    claim({ id: 'c2', session_id: 's2', session_date: '2026-08-10', diagnosis_codes: ['F321'] }),
+    claim({ id: 'c3', session_id: 's3', session_date: '2026-08-17', diagnosis_codes: ['F411'] }),
+  ]);
+  assert.strictEqual(r.ok, false);
+  const msg = r.conflicts.find((c) => c.code === 'mixed_diagnoses').message;
+
+  assert.ok(/2026-08-10/.test(msg), 'the offending service date is named');
+  assert.ok(/2026-08-03/.test(msg), 'and the one it differs from');
+  assert.ok(!/2026-08-17/.test(msg), 'a matching line is not blamed');
+  assert.ok(/Correct the diagnosis on those sessions/i.test(msg),
+    'and the message says where the fix lives');
+
+  // PHI discipline holds even while naming dates: no codes, no ids, no names.
+  assert.ok(!/F411|F321/.test(msg), 'diagnosis CODES never appear in a conflict message');
+});
+
+test('every mismatching date is named when several differ', () => {
+  const r = G.evaluateGroup([
+    claim({ id: 'c1', session_id: 's1', session_date: '2026-08-03', diagnosis_codes: ['F411'] }),
+    claim({ id: 'c2', session_id: 's2', session_date: '2026-08-10', diagnosis_codes: ['F321'] }),
+    claim({ id: 'c3', session_id: 's3', session_date: '2026-08-17', diagnosis_codes: ['F331'] }),
+  ]);
+  const msg = r.conflicts.find((c) => c.code === 'mixed_diagnoses').message;
+  assert.ok(/2026-08-10/.test(msg) && /2026-08-17/.test(msg),
+    'both offending dates are named, not just the first');
 });
 
 // --- the browser is not a second authority ------------------------------------

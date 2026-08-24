@@ -442,13 +442,50 @@ test('grouping is refused on ANY filing provenance, not just a non-draft status'
     const c = s.map((x) => mkClaim(x));
     c[1][field] = field === 'submitted_at' ? '2026-08-11T00:00:00Z' : 'CN-1';
 
+    const claimsBefore = claims.length;
+    const linesBefore = claimSessions.length;
+
     const res = await group([c[0].id, c[1].id]);
     assert.strictEqual(res.statusCode, 422, field + ' must block grouping');
     const body = JSON.parse(res.body);
     assert.ok(body.conflicts.some((x) => x.code === 'previously_transmitted'),
       field + ' is reported as previously transmitted');
-    assert.strictEqual(live().length, 2, 'nothing was retired');
+
+    // The point of this test: such a claim is INELIGIBLE, not merely stripped.
+    // Nothing is created and nothing is retired — the source keeps its identity
+    // and stays exactly where it was.
+    assert.strictEqual(claims.length, claimsBefore,
+      'no grouped claim is created when a source shows transmission evidence');
+    assert.strictEqual(claimSessions.length, linesBefore, 'and no service lines');
+    assert.deepStrictEqual(c.map((x) => x.is_hidden), [false, false],
+      'no source is retired');
+    assert.strictEqual(c[1][field] != null, true,
+      'the source keeps its ' + field + ' — grouping never strips provenance to admit a claim');
   }
+});
+
+test('TRANSMISSION evidence blocks; a mere submit-attempt artifact does not', async () => {
+  // The distinction this rule turns on, stated explicitly because it is easy to
+  // over- or under-apply:
+  //
+  //   control_number / submitted_at  → the claim reached the clearinghouse.
+  //                                    INELIGIBLE. Folding it into a new original
+  //                                    filing would be a duplicate.
+  //   patient_control_number         → minted by submitClaim BEFORE the network
+  //                                    call, so a submit blocked by a 422 leaves
+  //                                    it on a draft that was NEVER transmitted.
+  //                                    Eligible; simply not copied forward.
+  reset();
+  const s = [mkSession(), mkSession({ session_date: '2026-08-10' })];
+  const c = s.map((x) => mkClaim(x));
+  c[1].patient_control_number = 'PCN12345';   // a blocked submit attempt, never sent
+
+  const res = await group([c[0].id, c[1].id]);
+  assert.strictEqual(res.statusCode, 201,
+    'a never-transmitted draft is eligible even after a blocked submit attempt');
+  const row = claims.find((x) => x.id === JSON.parse(res.body).claim.id);
+  assert.strictEqual(row.patient_control_number, null,
+    'and the artifact is NOT carried onto the new claim');
 });
 
 test('rebuilt claims from ungroup carry no provenance either', async () => {
@@ -538,6 +575,72 @@ test('line charges and the claim total always agree after regeneration', async (
   const total = Math.round(Number(claims.find((x) => x.id === grouped.id).billed_amount) * 100);
   assert.strictEqual(lineSum, total,
     'the 837P line-sum invariant still holds — in cents, so float residue cannot break it');
+});
+
+// --- 5. the diagnosis-mismatch refusal, at the endpoint ----------------------
+
+test('DIAGNOSIS MISMATCH: refused, nothing created, nothing retired, reason names the date', async () => {
+  // Diagnosis-set equality is a grouping compatibility rule exactly like client,
+  // clinician, policy and place of service — the 837P emits ONE diagnosis set at
+  // claim level and every service line points into that shared list, so a mixed
+  // group would file one session under another session's diagnoses.
+  reset();
+  const s = [
+    mkSession({ session_date: '2026-08-03', diagnosis_codes: ['F411'] }),
+    mkSession({ session_date: '2026-08-10', diagnosis_codes: ['F321'] }),
+  ];
+  const c = s.map((x) => mkClaim(x));
+  const claimsBefore = claims.length;
+  const linesBefore = claimSessions.length;
+
+  const res = await group([c[0].id, c[1].id]);
+
+  // (1) refused
+  assert.strictEqual(res.statusCode, 422, res.body);
+  const body = JSON.parse(res.body);
+
+  // (4) the reason is the diagnosis mismatch
+  assert.ok(body.conflicts.some((x) => x.code === 'mixed_diagnoses'),
+    'the refusal reason is the diagnosis mismatch');
+
+  // (5) and it names the offending date of service
+  const msg = body.conflicts.find((x) => x.code === 'mixed_diagnoses').message;
+  assert.ok(/2026-08-10/.test(msg), 'the offending service date is named: ' + msg);
+  assert.ok(!/F411|F321/.test(msg), 'without leaking the diagnosis codes themselves');
+
+  // (2) no grouped claim was created
+  assert.strictEqual(claims.length, claimsBefore, 'no claim row was written');
+  assert.strictEqual(claimSessions.length, linesBefore, 'no service line was written');
+
+  // (3) no source was retired
+  assert.deepStrictEqual(c.map((x) => x.is_hidden), [false, false],
+    'both source drafts are untouched and still billable');
+  assert.strictEqual(live().length, 2);
+});
+
+test('diagnosis ORDER and CASE do not block grouping — it is a normalized SET', async () => {
+  reset();
+  const s = [
+    mkSession({ session_date: '2026-08-03', diagnosis_codes: ['F411', 'F321'] }),
+    mkSession({ session_date: '2026-08-10', diagnosis_codes: ['f321', ' F411 '] }),
+  ];
+  const c = s.map((x) => mkClaim(x));
+  const res = await group([c[0].id, c[1].id]);
+  assert.strictEqual(res.statusCode, 201, res.body);
+});
+
+test('CPT, fee and modifiers may differ across a group at the endpoint', async () => {
+  // Each rides its own service line, so these must NOT prevent grouping.
+  reset();
+  const s = [
+    mkSession({ session_date: '2026-08-03', cpt_code: '90791', fee: 250, procedure_modifiers: ['95'] }),
+    mkSession({ session_date: '2026-08-10', cpt_code: '90834', fee: 125, procedure_modifiers: null }),
+  ];
+  const c = s.map((x) => mkClaim(x));
+  const res = await group([c[0].id, c[1].id]);
+  assert.strictEqual(res.statusCode, 201, res.body);
+  assert.strictEqual(Number(JSON.parse(res.body).claim.billed_amount), 375,
+    'different charges simply sum onto one claim');
 });
 
 // --- runner -------------------------------------------------------------------
