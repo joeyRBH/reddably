@@ -60,6 +60,28 @@
   border-color: var(--color-border-strong);
 }
 
+/* An OUTSTANDING action that is not the page's single primary action: an ink
+ * border on an unfilled ground. It sits deliberately between --ghost (a stone
+ * hairline, for actions that are merely available) and --primary (solid ink, for
+ * the one action a screen is about), because the ladder previously jumped
+ * straight from "barely there" to "the big button" — which left real work
+ * (verify these benefits, get a card on file) wearing the quietest treatment in
+ * the system.
+ *
+ * Stone/ink only: per the design system, ink carries default action. Sage is
+ * earned by resolved state, so an action still waiting to happen never wears it.
+ * Once the action IS done, the caller drops the button back to --ghost and lets
+ * a sage badge carry the resolved state. */
+.btn--secondary {
+  background: transparent;
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+.btn--secondary:hover {
+  background: var(--color-primary-wash);
+  border-color: var(--color-primary-hover);
+}
+
 .btn--danger {
   background: var(--color-danger);
   color: var(--color-on-primary);
