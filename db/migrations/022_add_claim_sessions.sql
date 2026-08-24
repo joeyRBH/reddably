@@ -27,11 +27,42 @@
 -- DEPLOY ORDER — MIGRATION FIRST, THEN CODE. Nothing here migrates
 -- automatically (db/README.md; backend/handlers/migrate.js is operator-invoked).
 --   1. Apply this migration.
---   2. VERIFY, from a VPC-attached shell:
---        select count(*) from claim_sessions;                       -- backfilled
---        select count(*) from claims where is_hidden = false;       -- must match
---        select count(*) from claims c where not exists
---          (select 1 from claim_sessions cs where cs.claim_id = c.id);  -- 0
+--   2. VERIFY, from a VPC-attached shell. Each query states its own expected
+--      result; anything else means STOP and do not deploy the code.
+--
+--      (a) Every claim has at least one service line. This is THE invariant the
+--          backfill exists to establish — it is what lets the builder, the
+--          readiness projection and the detail view run one code path instead of
+--          branching on "grouped or legacy".
+--            select count(*) as claims_without_lines
+--              from claims c
+--             where not exists (select 1 from claim_sessions cs
+--                                where cs.claim_id = c.id);
+--            -- EXPECT 0
+--
+--      (b) Immediately after this migration, every claim has EXACTLY one line
+--          (nothing has been grouped yet).
+--            select count(*) as claims_with_extra_lines from (
+--              select cs.claim_id from claim_sessions cs
+--               group by cs.claim_id having count(*) > 1
+--            ) t;
+--            -- EXPECT 0 immediately after applying; grows legitimately once
+--            -- staff start grouping.
+--
+--      (c) MONEY CHECK. For a backfilled 1:1 claim the line charge IS the claim
+--          charge, so the two must agree everywhere. A mismatch here would mean
+--          the very first 837P built from that claim is refused by the builder's
+--          line-sum invariant.
+--            select count(*) as charge_mismatches
+--              from claims c join claim_sessions cs on cs.claim_id = c.id
+--             where cs.line_charge is distinct from c.billed_amount;
+--            -- EXPECT 0
+--
+--      NOTE: do NOT compare count(*) on claim_sessions against the count of
+--      NON-HIDDEN claims. The backfill deliberately covers hidden (soft-deleted)
+--      claims too, so the row count matches ALL claims. Comparing against the
+--      visible subset reads as a failed migration when nothing is wrong.
+--
 --   3. Deploy the Lambda backend, then the Vercel frontend.
 -- Code-before-migration fails loudly (42P01 undefined table) on claim submit
 -- rather than mis-billing anything, but it is still an outage — do it in order.

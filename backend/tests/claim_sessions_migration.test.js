@@ -77,10 +77,35 @@ test('schema.sql carries the same table and the same backfill', () => {
     'a fresh database applied from schema.sql gets the backfill too');
 });
 
-test('the deploy order is documented in the migration itself', () => {
+test('the deploy order and its verification queries are in the migration itself', () => {
   assert.ok(/MIGRATION FIRST, THEN CODE/i.test(sql), 'the ordering is stated');
-  assert.ok(/information_schema|select count\(\*\) from claim_sessions/i.test(sql),
-    'a concrete verification step is given, not just an instruction to verify');
+
+  // Concrete, runnable checks — not just an instruction to verify. Each must
+  // state its own expected result, or an operator cannot tell pass from fail.
+  const expectations = sql.match(/-- EXPECT /g) || [];
+  assert.ok(expectations.length >= 3,
+    'at least three verification queries with stated expectations, got ' + expectations.length);
+
+  assert.ok(/claims_without_lines/.test(sql), 'checks the one-code-path invariant');
+  assert.ok(/charge_mismatches/.test(sql), 'checks line charge against claim total');
+
+  // The trap this replaced: the backfill covers HIDDEN claims too, so comparing
+  // claim_sessions against the count of non-hidden claims reads as a failed
+  // migration when nothing is wrong. The warning must stay.
+  assert.ok(/do NOT compare[\s\S]*NON-HIDDEN claims/i.test(sql),
+    'the misleading row-count comparison is explicitly warned against');
+  assert.ok(!/select count\(\*\) from claims where is_hidden = false;\s+-- must match/i.test(sql),
+    'and is not itself present as a suggested check');
+});
+
+test('the backfill really does cover hidden claims — the reason for that warning', () => {
+  // Asserted against the SQL rather than trusted: the backfill's only predicate
+  // is the NOT EXISTS guard. No is_hidden filter, so soft-deleted claims get
+  // lines too and the row count matches ALL claims.
+  const backfill = sql.slice(sql.lastIndexOf('insert into claim_sessions'));
+  assert.ok(/from claims c/i.test(backfill));
+  assert.ok(!/is_hidden/i.test(backfill),
+    'the backfill does not filter on is_hidden, so it covers every claim');
 });
 
 // --- 2. the backfill's set semantics -----------------------------------------
