@@ -1708,39 +1708,52 @@ async function groupClaims(practiceId, userId, body, event, authCtx) {
     }, event);
   }
 
-  // Load them practice-scoped, with the session fields the rules compare.
-  const res = await db.query(
-    `select c.*, s.session_date, s.cpt_code, s.place_of_service,
-            s.diagnosis_codes as session_diagnosis_codes
-       from claims c
-       join sessions s on s.id = c.session_id
-      where c.practice_id = $1 and c.is_hidden = false and c.id = any($2::uuid[])`,
-    [practiceId, unique]
-  );
-  if (res.rowCount !== unique.length) {
-    // A missing id is indistinguishable from another practice's claim, by design.
-    return json(404, { error: 'Not found' }, event);
-  }
+  // EVERYTHING below happens in ONE transaction: loading the candidates, judging
+  // them, computing the total, retiring the sources and writing the grouped claim
+  // with its lines. Validating outside and acting inside would judge one snapshot
+  // and act on another.
+  //
+  // FOR UPDATE OF c is what makes overlapping concurrent groupings safe. Tab A
+  // grouping {1,2,3} and tab B grouping {3,4,5} both want claim 3; the second
+  // transaction BLOCKS on that row until the first commits, then (READ COMMITTED
+  // re-evaluation) re-reads it as is_hidden = true and its own load comes up
+  // short, so it refuses rather than filing the same service on two live claims.
+  // The (claim_id, session_id) unique constraint cannot catch that on its own —
+  // the duplicate would sit under two different claim ids.
+  const outcome = await db.withTransaction(async (client) => {
+    const res = await client.query(
+      `select c.*, s.session_date, s.cpt_code, s.place_of_service,
+              s.diagnosis_codes as session_diagnosis_codes
+         from claims c
+         join sessions s on s.id = c.session_id
+        where c.practice_id = $1 and c.is_hidden = false and c.id = any($2::uuid[])
+        for update of c`,
+      [practiceId, unique]
+    );
+    if (res.rowCount !== unique.length) {
+      // A missing id, a claim of another practice, and one another tab just
+      // grouped are deliberately indistinguishable from here.
+      return { status: 404, body: { error: 'Not found' } };
+    }
 
-  const candidates = res.rows.map((r) => Object.assign({}, r, {
-    diagnosis_codes: r.session_diagnosis_codes,
-  }));
-  const verdict = evaluateGroup(candidates);
-  if (!verdict.ok) {
-    return json(422, {
-      error: verdict.conflicts[0].message,
-      conflicts: verdict.conflicts,
-    }, event);
-  }
+    const candidates = res.rows.map((r) => Object.assign({}, r, {
+      diagnosis_codes: r.session_diagnosis_codes,
+    }));
+    const verdict = evaluateGroup(candidates);
+    if (!verdict.ok) {
+      return {
+        status: 422,
+        body: { error: verdict.conflicts[0].message, conflicts: verdict.conflicts },
+      };
+    }
 
-  const ordered = orderForFiling(candidates);
-  const first = ordered[0];
+    const ordered = orderForFiling(candidates);
+    const first = ordered[0];
 
-  const grouped = await db.withTransaction(async (client) => {
-    // Re-assert the source claims are still draft INSIDE the transaction, and
-    // retire them in the same statement that checks. A concurrent submit of one
-    // of them would otherwise be folded into a group after it had already been
-    // filed. Zero rows updated means something changed underneath us.
+    // Retire the sources. The predicate re-states every provenance condition the
+    // rules already checked — belt and braces against a row that changed between
+    // the lock and here (it cannot, while we hold FOR UPDATE, which is exactly
+    // the point: this must stay true even if the locking above is ever weakened).
     const retire = await client.query(
       `update claims
           set is_hidden = true
@@ -1750,8 +1763,17 @@ async function groupClaims(practiceId, userId, body, event, authCtx) {
         returning id`,
       [practiceId, ordered.map((c) => c.id)]
     );
-    if (retire.rowCount !== ordered.length) return null;
+    if (retire.rowCount !== ordered.length) {
+      return {
+        status: 409,
+        body: { error: 'One of these claims changed while grouping — it may have just been submitted or deleted. Reload and try again.' },
+      };
+    }
 
+    // The grouped claim carries NO filing provenance: no control number, no
+    // patient control number, no clearinghouse, no submitted_at, no frequency
+    // code, no corrects_claim_id. It is a brand-new original draft, and nothing
+    // from the retired claims' submission identity is copied onto it.
     const created = await insertGroupedClaim(client, {
       practiceId,
       clientId: first.client_id,
@@ -1774,23 +1796,19 @@ async function groupClaims(practiceId, userId, body, event, authCtx) {
           ' and retired unsubmitted; it was never filed and never charged a fee.',
       });
     }
-    return created;
+    return { status: 201, claim: created, sourceIds: ordered.map((c) => c.id) };
   });
 
-  if (!grouped) {
-    return json(409, {
-      error: 'One of these claims changed while grouping — it may have just been submitted or deleted. Reload and try again.',
-    }, event);
-  }
+  if (outcome.status !== 201) return json(outcome.status, outcome.body, event);
 
   await audit(event, authCtx, {
     action: 'claim.group',
     resourceType: 'claim',
-    resourceId: grouped.id,
+    resourceId: outcome.claim.id,
     // Counts and ids only — never an amount, never a patient.
-    metadata: { lines: ordered.length, source_claim_ids: ordered.map((c) => c.id) },
+    metadata: { lines: outcome.sourceIds.length, source_claim_ids: outcome.sourceIds },
   });
-  return json(201, { claim: shapeClaim(grouped) }, event);
+  return json(201, { claim: shapeClaim(outcome.claim) }, event);
 }
 
 // POST /claims/{id}/ungroup
@@ -1816,12 +1834,29 @@ async function ungroupClaim(practiceId, userId, id, event, authCtx) {
     }, event);
   }
 
-  const lines = await loadClaimSessions(db, practiceId, claim.id);
-  if (lines.length < 2) {
-    return json(409, { error: 'This claim has a single service line — there is nothing to ungroup.' }, event);
-  }
+  // ONE transaction: lock the claim, read its lines, retire it, and rebuild the
+  // separate drafts. If ANY rebuild throws, db.withTransaction rolls the whole
+  // thing back — the grouped claim is still there and no partial drafts survive.
+  // The alternative (retire, then rebuild, and fail halfway) leaves the practice
+  // with three drafts AND the grouped claim, all billable.
+  const outcome = await db.withTransaction(async (client) => {
+    // Lock first, so a concurrent submit of this claim cannot interleave.
+    const locked = await client.query(
+      `select id from claims
+        where id = $1 and practice_id = $2 and is_hidden = false and status = 'draft'
+          and control_number is null and submitted_at is null
+        for update`,
+      [claim.id, practiceId]
+    );
+    if (locked.rowCount === 0) {
+      return { status: 409, body: { error: 'This claim changed while ungrouping. Reload and try again.' } };
+    }
 
-  const rebuilt = await db.withTransaction(async (client) => {
+    const lines = await loadClaimSessions(client, practiceId, claim.id);
+    if (lines.length < 2) {
+      return { status: 409, body: { error: 'This claim has a single service line — there is nothing to ungroup.' } };
+    }
+
     const gone = await client.query(
       `update claims set is_hidden = true
         where id = $1 and practice_id = $2 and is_hidden = false and status = 'draft'
@@ -1829,7 +1864,9 @@ async function ungroupClaim(practiceId, userId, id, event, authCtx) {
         returning id`,
       [claim.id, practiceId]
     );
-    if (gone.rowCount === 0) return null;
+    if (gone.rowCount === 0) {
+      return { status: 409, body: { error: 'This claim changed while ungrouping. Reload and try again.' } };
+    }
 
     const out = [];
     for (const line of lines) {
@@ -1852,20 +1889,18 @@ async function ungroupClaim(practiceId, userId, id, event, authCtx) {
       eventType: 'note',
       note: 'Ungrouped into ' + out.length + ' separate draft claims and retired unsubmitted.',
     });
-    return out;
+    return { status: 200, claims: out };
   });
 
-  if (!rebuilt) {
-    return json(409, { error: 'This claim changed while ungrouping. Reload and try again.' }, event);
-  }
+  if (outcome.status !== 200) return json(outcome.status, outcome.body, event);
 
   await audit(event, authCtx, {
     action: 'claim.ungroup',
     resourceType: 'claim',
     resourceId: claim.id,
-    metadata: { lines: rebuilt.length, claim_ids: rebuilt.map((c) => c.id) },
+    metadata: { lines: outcome.claims.length, claim_ids: outcome.claims.map((c) => c.id) },
   });
-  return json(200, { claims: rebuilt.map(shapeClaim) }, event);
+  return json(200, { claims: outcome.claims.map(shapeClaim) }, event);
 }
 
 async function listEvents(practiceId, id, event) {

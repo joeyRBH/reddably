@@ -212,6 +212,55 @@ test('conflict messages name dates of service, never patient identifiers', () =>
     'no client id, policy id, user id or diagnosis code leaks into a message');
 });
 
+// --- service-line attributes MAY differ ---------------------------------------
+
+test('CPT, fee and modifiers are SERVICE-LINE attributes and may differ', () => {
+  // Each rides its own 837P service line, so two sessions with different codes,
+  // charges or modifiers belong on one claim just fine. Only the CLAIM-level
+  // fields have to match.
+  const r = G.evaluateGroup(pair(
+    { cpt_code: '90791', billed_amount: 250 },
+    { cpt_code: '90834', billed_amount: 125 }
+  ));
+  assert.strictEqual(r.ok, true, JSON.stringify(r.conflicts));
+  assert.strictEqual(r.total, 375, 'different charges simply sum');
+});
+
+test('the must-match set is exactly the claim-level fields, and no more', () => {
+  // A guard against the set quietly growing: adding a field here means claims
+  // that could legitimately be filed together stop being groupable.
+  assert.deepStrictEqual(G.CLAIM_LEVEL_FIELDS.map((f) => f.key).sort(),
+    ['client_id', 'clinician_id', 'insurance_record_id', 'place_of_service'],
+    'client, rendering clinician, policy, place of service — plus the diagnosis set');
+});
+
+// --- the browser is not a second authority ------------------------------------
+
+test('the grouping rules exist ONLY on the server', () => {
+  // The UI deliberately does not re-implement eligibility: a second copy would be
+  // a second, silently divergent definition of what may be filed together on one
+  // claim, and the divergence would surface as a wrongly-FILED claim rather than
+  // a broken button. The view offers the action and renders the server's
+  // conflicts verbatim.
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const view = fs.readFileSync(
+    path.join(__dirname, '..', '..', 'public', 'app', 'views', 'claims.js'), 'utf8');
+
+  // The rule vocabulary. None of it may appear in the browser bundle.
+  [
+    'MAX_GROUPED_LINES', 'evaluateGroup', 'CLAIM_LEVEL_FIELDS',
+    'sameDiagnoses', 'normalizedDiagnoses', 'orderForFiling',
+    'mixed_client_id', 'previously_transmitted', 'duplicate_session',
+  ].forEach((token) => {
+    assert.ok(view.indexOf(token) === -1,
+      'views/claims.js must not contain "' + token + '" — the server decides eligibility');
+  });
+
+  // And it must still SHOW what the server decided.
+  assert.ok(/conflicts/.test(view), 'the view renders the server-returned conflicts');
+});
+
 // --- runner -------------------------------------------------------------------
 
 let failed = 0;

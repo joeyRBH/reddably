@@ -217,6 +217,99 @@ test('place of service and diagnoses stay CLAIM-level', () => {
     'one diagnosis set for the whole claim');
 });
 
+// --- 5. line semantics: order, units, and diagnosis pointers ------------------
+
+test('service lines are emitted in deterministic date-of-service order', () => {
+  // The order is fixed at grouping time (claim_sessions.position, assigned in
+  // date order) and read back by position, so a resubmission emits the same
+  // sequence and the 277CA/835 line references still align.
+  const body = build({
+    claim: { id: base.claim.id, billed_amount: '450.00' },
+    sessions: [
+      line({ id: 's1', session_date: '2026-06-01', line_charge: '150.00' }),
+      line({ id: 's2', session_date: '2026-06-08', line_charge: '150.00' }),
+      line({ id: 's3', session_date: '2026-06-15', line_charge: '150.00' }),
+    ],
+  });
+  assert.deepStrictEqual(
+    body.claimInformation.serviceLines.map((l) => l.serviceDate),
+    ['20260601', '20260608', '20260615']
+  );
+  // And it is a function of the input order alone — same input, same output.
+  const again = build({
+    claim: { id: base.claim.id, billed_amount: '450.00' },
+    sessions: [
+      line({ id: 's1', session_date: '2026-06-01', line_charge: '150.00' }),
+      line({ id: 's2', session_date: '2026-06-08', line_charge: '150.00' }),
+      line({ id: 's3', session_date: '2026-06-15', line_charge: '150.00' }),
+    ],
+  });
+  assert.strictEqual(JSON.stringify(again.claimInformation.serviceLines),
+    JSON.stringify(body.claimInformation.serviceLines), 'deterministic');
+});
+
+test('every line carries its own units, and one unit each', () => {
+  const body = build({
+    claim: { id: base.claim.id, billed_amount: '300.00' },
+    sessions: [line({ id: 's1', line_charge: '150.00' }),
+      line({ id: 's2', line_charge: '150.00', session_date: '2026-06-08' })],
+  });
+  body.claimInformation.serviceLines.forEach((l, i) => {
+    assert.strictEqual(l.professionalService.measurementUnit, 'UN', 'line ' + i);
+    assert.strictEqual(l.professionalService.serviceUnitCount, '1', 'line ' + i);
+    assert.strictEqual(l.professionalService.procedureIdentifier, 'HC', 'line ' + i);
+  });
+});
+
+test('diagnosis pointers on EVERY line resolve to a real claim-level diagnosis', () => {
+  // Diagnoses live at the CLAIM level; each line points into that list by
+  // 1-based index. A pointer past the end of the list is an 837P the payer
+  // rejects, so every pointer on every line is checked against the emitted set.
+  const body = build({
+    claim: { id: base.claim.id, billed_amount: '450.00' },
+    session: {
+      cpt_code: '90837', session_date: '2026-06-01',
+      diagnosis_codes: ['F411', 'F321', 'F331'],
+    },
+    sessions: [
+      line({ id: 's1', line_charge: '150.00' }),
+      line({ id: 's2', line_charge: '150.00', session_date: '2026-06-08' }),
+      line({ id: 's3', line_charge: '150.00', session_date: '2026-06-15' }),
+    ],
+  });
+
+  const claimDx = body.claimInformation.healthCareCodeInformation;
+  assert.strictEqual(claimDx.length, 3, 'the shared set is emitted once, at claim level');
+  assert.strictEqual(claimDx[0].diagnosisTypeCode, 'ABK', 'first is the principal');
+  assert.ok(claimDx.slice(1).every((d) => d.diagnosisTypeCode === 'ABF'), 'the rest are secondary');
+
+  body.claimInformation.serviceLines.forEach((l, i) => {
+    const pointers = l.professionalService.compositeDiagnosisCodePointers.diagnosisCodePointers;
+    assert.ok(pointers.length > 0, 'line ' + i + ' points at something');
+    pointers.forEach((ptr) => {
+      const idx = Number(ptr);
+      assert.ok(Number.isInteger(idx) && idx >= 1 && idx <= claimDx.length,
+        'line ' + i + ' pointer ' + ptr + ' is within the claim diagnosis list (1..' + claimDx.length + ')');
+    });
+  });
+});
+
+test('pointers stay within the LINE limit even with many claim diagnoses', () => {
+  // The claim allows 12 diagnoses; a service line allows only 4 pointers (SV107).
+  // Emitting one pointer per claim diagnosis would overflow the segment.
+  const many = ['F411', 'F321', 'F331', 'F401', 'F431', 'F500'];
+  const body = build({
+    claim: { id: base.claim.id, billed_amount: '300.00' },
+    session: { cpt_code: '90837', session_date: '2026-06-01', diagnosis_codes: many },
+    sessions: [line({ id: 's1', line_charge: '150.00' }),
+      line({ id: 's2', line_charge: '150.00', session_date: '2026-06-08' })],
+  });
+  body.claimInformation.serviceLines.forEach((l) => {
+    const pointers = l.professionalService.compositeDiagnosisCodePointers.diagnosisCodePointers;
+    assert.ok(pointers.length <= 4, 'at most four pointers per line, got ' + pointers.length);
+  });
+});
+
 // --- runner -------------------------------------------------------------------
 
 let failed = 0;
