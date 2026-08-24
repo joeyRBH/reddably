@@ -291,13 +291,132 @@
     // Section 1 — the verification queue. Everything a human checks before a
     // claim goes out is on the row: who, when, what was done, what it cost, who
     // pays, and what the server's readiness projection currently says.
+    // MONEY-PATH: fold the ticked drafts into ONE claim with one service line per
+    // session. The patient is billed the same 5% of the same total, as a single
+    // charge instead of one per session.
+    //
+    // The rules deciding what may be grouped live ONLY on the server
+    // (backend/lib/claim_grouping.js). This view deliberately does not
+    // re-implement them: a second copy would be a second, silently divergent
+    // definition of what may be filed together on one claim, and the divergence
+    // would show up as a wrongly-filed claim rather than a broken button. The
+    // button is offered for any two-or-more selection; the server answers with
+    // EVERY conflict at once and they are listed verbatim.
+    function groupSelected(ids, onDone) {
+      api.claims.group(ids).then(function (res) {
+        R.toast('Grouped into one claim — one submission, one fee', 'success');
+        if (res && res.claim) R.navigate('claims/' + res.claim.id);
+        else onDone();
+      }).catch(function (err) {
+        var conflicts = (err && err.body && err.body.conflicts) || null;
+        if (!conflicts || !conflicts.length) {
+          R.toast((err && err.message) || 'Could not group these claims', 'error');
+          return;
+        }
+        R.confirmModal({
+          title: 'These claims cannot be grouped',
+          body: h('div', { class: 'stack', style: 'gap:var(--space-3)' }, [
+            h('p', { style: 'margin:0' },
+              'One claim form carries a single client, clinician, policy, place of '
+              + 'service and diagnosis set, so these have to be filed separately:'),
+            h('ul', { style: 'margin:0;padding-left:var(--space-5)' },
+              conflicts.map(function (c) {
+                return h('li', { style: 'margin-bottom:var(--space-2)' }, c.message);
+              })),
+          ]),
+          confirmLabel: 'OK',
+          cancelLabel: 'Close',
+        });
+      });
+    }
+
+    function confirmGroup(selected, onDone) {
+      var total = selected.reduce(function (sum, c) {
+        var n = Number(c.billed_amount);
+        return sum + (isFinite(n) ? n : 0);
+      }, 0);
+
+      R.confirmModal({
+        title: 'Group ' + selected.length + ' claims into one?',
+        body: h('div', { class: 'stack', style: 'gap:var(--space-3)' }, [
+          h('p', { style: 'margin:0' },
+            'These become ONE claim with ' + selected.length + ' service lines — one '
+            + 'submission to the payer instead of ' + selected.length + '.'),
+          h('table', { class: 'data-table' }, [
+            h('thead', null, h('tr', null, [
+              h('th', null, 'Date of service'),
+              h('th', null, 'CPT'),
+              h('th', { class: 'data-table__num' }, 'Charge'),
+            ])),
+            h('tbody', null, selected.slice().sort(byServiceDate).map(function (c) {
+              return h('tr', null, [
+                h('td', null, R.fmtDate(c.session_date)),
+                h('td', null, c.cpt_code || '—'),
+                h('td', { class: 'data-table__num' }, R.fmtMoney(c.billed_amount)),
+              ]);
+            })),
+          ]),
+          // The whole point, stated plainly. The AMOUNT does not change — only
+          // how many times the card is charged — and saying so avoids the reading
+          // that grouping is a discount.
+          h('p', {
+            style: 'margin:0;color:var(--color-text-muted);font-size:var(--font-size-2);max-width:62ch',
+          }, 'Total billed to the payer: ' + R.fmtMoney(total)
+            + '. The platform fee is unchanged — the same percentage of the same total, '
+            + 'charged once instead of ' + selected.length + ' times.'),
+          h('p', {
+            style: 'margin:0;color:var(--color-text-muted);font-size:var(--font-size-2);max-width:62ch',
+          }, 'The original drafts are retired unsubmitted. They were never filed and '
+            + 'never charged a fee. You can split the grouped claim again before submitting.'),
+        ]),
+        confirmLabel: 'Group into one claim',
+        cancelLabel: 'Cancel',
+      }).then(function (ok) {
+        if (ok) groupSelected(selected.map(function (c) { return c.id; }), onDone);
+      });
+    }
+
     function draftsCard(drafts) {
       var body;
+      // id -> claim, for everything currently ticked. Lives per render, so a
+      // reload clears it rather than acting on claims that may no longer exist.
+      var selected = {};
+      var groupBtn = h('button', {
+        class: 'btn btn--secondary btn--sm', type: 'button',
+        onClick: function () {
+          var rows = Object.keys(selected).map(function (id) { return selected[id]; });
+          if (rows.length >= 2) confirmGroup(rows, function () { load(); });
+        },
+      }, 'Group selected');
+      groupBtn.disabled = true;
+
+      function refreshGroupBtn() {
+        var n = Object.keys(selected).length;
+        groupBtn.disabled = n < 2;
+        groupBtn.textContent = n >= 2 ? 'Group ' + n + ' claims into one' : 'Group selected';
+      }
+
       if (!drafts.length) {
         body = inlineEmpty('No claims waiting for verification.');
       } else {
         var rows = drafts.slice().sort(byServiceDate).map(function (c) {
-          return claimRow([
+          // The checkbox owns its own click: the row navigates to the claim, and
+          // ticking a box must not do that too.
+          var box = h('input', {
+            type: 'checkbox',
+            class: 'field__checkbox',
+            'aria-label': 'Select the claim for ' + (c.client_name || 'this client')
+              + ' on ' + R.fmtDate(c.session_date),
+          });
+          box.addEventListener('click', function (e) { e.stopPropagation(); });
+          box.addEventListener('change', function () {
+            if (box.checked) selected[c.id] = c;
+            else delete selected[c.id];
+            refreshGroupBtn();
+          });
+
+          var row = claimRow([
+            h('td', null, box),
             h('td', null, clientCell(c)),
             h('td', null, R.fmtDate(c.session_date)),
             h('td', null, c.cpt_code || '—'),
@@ -306,9 +425,11 @@
             h('td', null, payerCell(c)),
             h('td', null, readinessCell(c.readiness)),
           ], c.id);
+          return row;
         });
         body = h('table', { class: 'data-table' }, [
           h('thead', null, h('tr', null, [
+            h('th', { 'aria-label': 'Select' }, ''),
             h('th', null, 'Client'),
             h('th', null, 'Date of service'),
             h('th', null, 'CPT'),
@@ -324,7 +445,15 @@
       return h('div', { class: 'card' }, [
         h('div', { class: 'card__header' }, [
           h('h2', { class: 'card__title' }, 'Ready to verify and submit'),
+          drafts.length ? groupBtn : null,
         ]),
+        drafts.length
+          ? h('p', {
+            style: 'margin:0 0 var(--space-3);color:var(--color-text-muted);'
+              + 'font-size:var(--font-size-2);max-width:70ch',
+          }, 'Tick several sessions for the same client to file them on one claim — '
+            + 'one submission, and one platform fee on the total instead of one per session.')
+          : null,
         body,
       ]);
     }
@@ -725,6 +854,84 @@
       });
     }
 
+    // The claim's service lines — CMS-1500 Box 24. Rendered for EVERY claim, so a
+    // single-line claim reads the same way a grouped one does and there is no
+    // "grouped mode" for a user to be surprised by. Amounts stay ink-led; the
+    // anchor line is marked only because it is the session every legacy view
+    // still reads.
+    function serviceLinesCard(claim) {
+      var lines = (claim && claim.service_lines) || [];
+      if (!lines.length) return null;
+
+      var rows = lines.map(function (line, i) {
+        return h('tr', null, [
+          h('td', null, String(i + 1)),
+          h('td', null, R.fmtDate(line.session_date)),
+          h('td', null, line.cpt_code || '—'),
+          h('td', null, (line.procedure_modifiers || []).join(', ') || '—'),
+          h('td', { class: 'data-table__num' }, R.fmtMoney(line.line_charge)),
+        ]);
+      });
+
+      var canUngroup = lines.length > 1 && claim.status === 'draft';
+
+      return h('div', { class: 'card' }, [
+        h('div', { class: 'card__header' }, [
+          h('h2', { class: 'card__title' },
+            lines.length > 1 ? 'Service lines (' + lines.length + ')' : 'Service line'),
+          canUngroup
+            ? h('button', {
+              class: 'btn btn--ghost btn--sm', type: 'button',
+              onClick: function () { doUngroup(claim); },
+            }, 'Split into separate claims')
+            : null,
+        ]),
+        h('table', { class: 'data-table' }, [
+          h('thead', null, h('tr', null, [
+            h('th', null, '#'),
+            h('th', null, 'Date of service'),
+            h('th', null, 'CPT'),
+            h('th', null, 'Modifiers'),
+            h('th', { class: 'data-table__num' }, 'Charge'),
+          ])),
+          h('tbody', null, rows),
+        ]),
+        lines.length > 1
+          ? h('p', {
+            style: 'margin:var(--space-3) 0 0;color:var(--color-text-muted);'
+              + 'font-size:var(--font-size-2);max-width:70ch',
+          }, 'One claim, ' + lines.length + ' dates of service. It is submitted once '
+            + 'and draws a single platform fee on the total.')
+          : null,
+      ]);
+    }
+
+    function doUngroup(claim) {
+      var count = (claim.service_lines || []).length;
+      R.confirmModal({
+        title: 'Split this claim into ' + count + ' separate claims?',
+        body: h('div', { class: 'stack', style: 'gap:var(--space-2)' }, [
+          h('p', { style: 'margin:0' },
+            'Each service line becomes its own draft claim again, keeping its own charge.'),
+          // The honest consequence, said before the click rather than discovered
+          // on the patient's statement afterwards.
+          h('p', { style: 'margin:0;color:var(--color-text-muted);font-size:var(--font-size-2)' },
+            'Submitted separately, they will each charge their own platform fee — '
+            + count + ' charges instead of one.'),
+        ]),
+        confirmLabel: 'Split into ' + count + ' claims',
+        cancelLabel: 'Keep as one claim',
+      }).then(function (ok) {
+        if (!ok) return;
+        api.claims.ungroup(claim.id).then(function () {
+          R.toast('Split into ' + count + ' separate draft claims', 'success');
+          R.navigate('claims');
+        }).catch(function (err) {
+          R.toast((err && err.message) || 'Could not split this claim', 'error');
+        });
+      });
+    }
+
     // Show only the buttons allowed for the current status (see matrix).
     function actionsFor(claim) {
       var s = claim.status;
@@ -991,6 +1198,8 @@
       var view = h('div', { class: 'view stack' }, [
         backLink(),
         headerCard(claim, contextEl),
+        // What this claim actually bills, before who it bills for.
+        serviceLinesCard(claim),
         patientCard(claim),
         eventsCard(events),
       ]);

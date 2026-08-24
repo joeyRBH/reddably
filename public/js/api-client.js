@@ -368,6 +368,21 @@
     // replacement intent, which the operator then submits (with a confirm dialog).
     // payload: { payer_claim_control_number } — the payer's original claim number.
     replace: function (id, payload) { return request('POST', '/claims/' + id + '/replace', payload); },
+
+    // MONEY-PATH. Fold several DRAFT claims for one client into a single
+    // multi-line claim — one filing with the payer, and one platform fee on the
+    // summed charge instead of one per session.
+    //
+    // Eligibility is decided by the SERVER (lib/claim_grouping.js). A 422 carries
+    // { error, conflicts: [{ code, message }] } listing every reason at once; the
+    // view renders them rather than re-implementing the rules, so there is no
+    // second, silently divergent definition of what may be filed together.
+    group: function (claimIds) { return request('POST', '/claims/group', { claim_ids: claimIds }); },
+
+    // Split a grouped DRAFT back into one claim per service line. Each rebuilt
+    // claim charges its own fee if submitted separately — the honest consequence
+    // of filing them apart.
+    ungroup: function (id) { return request('POST', '/claims/' + id + '/ungroup', {}); },
   };
 
   var users = {

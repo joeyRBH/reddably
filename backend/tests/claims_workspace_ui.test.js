@@ -306,38 +306,41 @@ function plain(v) {
   assert.strictEqual(order[1], submitted, 'submitted history comes second');
 
   // 3. Partitioning: every draft above, every non-draft below, nothing shared.
-  const draftIds = bodyRows(drafts).map((r) => cellTexts(r)[0]);
+  const draftIds = bodyRows(drafts).map((r) => cellTexts(r)[1]);
   assert.strictEqual(bodyRows(drafts).length, DRAFTS.length, 'every draft is in the draft section');
   assert.strictEqual(bodyRows(submitted).length, HISTORY.length, 'every non-draft is in history');
   ['h-paid', 'h-void', 'h-denied', 'h-sentinel'].forEach((id) => {
     assert.ok(!drafts.textContent.includes(id), id + ' never appears in the draft queue');
   });
 
-  // 4. Draft rows carry the full verification set, in order.
+  // 4. Draft rows carry the full verification set, in order. The leading blank
+  // header is the grouping selection column — ticking several sessions for one
+  // client files them on a single multi-line claim.
   assert.deepStrictEqual(headers(drafts), [
-    'Client', 'Date of service', 'CPT', 'Diagnosis', 'Billed', 'Payer', 'Validation',
+    '', 'Client', 'Date of service', 'CPT', 'Diagnosis', 'Billed', 'Payer', 'Validation',
   ], 'a draft row shows everything a human verifies');
 
+  // Cell indices are 1-based past the leading selection checkbox.
   const newest = bodyRows(drafts)[0];
-  assert.strictEqual(cellTexts(newest)[0], 'Client Newest');
-  assert.strictEqual(cellTexts(newest)[1], '2026-07-10');
-  assert.strictEqual(cellTexts(newest)[2], '90837');
-  assert.strictEqual(cellTexts(newest)[3], 'F411, F331, F401 +1',
+  assert.strictEqual(cellTexts(newest)[1], 'Client Newest');
+  assert.strictEqual(cellTexts(newest)[2], '2026-07-10');
+  assert.strictEqual(cellTexts(newest)[3], '90837');
+  assert.strictEqual(cellTexts(newest)[4], 'F411, F331, F401 +1',
     'multiple diagnoses read concisely, in their stored order');
-  assert.strictEqual(cellTexts(newest)[4], '$150.00');
-  assert.strictEqual(cellTexts(newest)[5], 'Aetna');
-  assert.ok(cellTexts(newest)[6].indexOf('Review warning') === 0, 'the readiness verdict is shown');
+  assert.strictEqual(cellTexts(newest)[5], '$150.00');
+  assert.strictEqual(cellTexts(newest)[6], 'Aetna');
+  assert.ok(cellTexts(newest)[7].indexOf('Review warning') === 0, 'the readiness verdict is shown');
 
   // 5. Drafts sort by service date descending, created_at as the tie-breaker.
   assert.deepStrictEqual(
-    bodyRows(drafts).map((r) => cellTexts(r)[1]),
+    bodyRows(drafts).map((r) => cellTexts(r)[2]),
     ['2026-07-10', '2026-06-15', '2026-06-15', '2026-05-01'],
     'drafts are newest date of service first'
   );
   // The two 2026-06-15 drafts share a service date, so created_at breaks the
   // tie deterministically — later creation first.
   assert.deepStrictEqual(
-    bodyRows(drafts).slice(1, 3).map((r) => cellTexts(r)[0]),
+    bodyRows(drafts).slice(1, 3).map((r) => cellTexts(r)[1]),
     ['Client Later', 'Client Earlier'],
     'same-day drafts fall back to creation time descending, stably'
   );
@@ -350,10 +353,17 @@ function plain(v) {
   assert.ok(!draftText.includes('Ready to submit'),
     'the verdict is never phrased as ready to submit');
 
-  // 7. The badge is informational — the list acts on nothing.
+  // 7. The badge is informational, and the list still never DECIDES anything
+  // about a claim. Grouping is the one action here, and it composes drafts —
+  // it files nothing. Submitting, approving, voiding and deleting all stay on
+  // the detail screen, which is the invariant this originally protected.
   const draftButtons = buttonLabels(drafts);
-  assert.deepStrictEqual(draftButtons, [],
-    'a draft row offers no submit, approve, or batch action — submission stays on the detail screen');
+  assert.deepStrictEqual(draftButtons, ['Group selected'],
+    'the draft queue offers grouping and nothing else');
+  ['Submit', 'Approve', 'Delete', 'Void', 'Replace'].forEach((label) => {
+    assert.ok(!draftButtons.some((b) => b.indexOf(label) !== -1),
+      'the list never offers "' + label + '" — that decision stays on the detail screen');
+  });
   assert.ok(!/submit|approve|send/i.test(draftText.replace('Ready to verify and submit', '')),
     'nothing in the queue reads as an action on the claim');
   // Rows open the existing detail screen.
@@ -454,8 +464,8 @@ function plain(v) {
 
   // 15. The cache-buster for this view was bumped.
   const appHtml = fs.readFileSync(path.join(__dirname, '..', '..', 'public', 'app', 'app.html'), 'utf8');
-  assert.match(appHtml, /\.\/views\/claims\.js\?v=20260824a/,
-    'app.html serves claims.js?v=20260824a');
+  assert.match(appHtml, /\.\/views\/claims\.js\?v=20260824b/,
+    'app.html serves claims.js?v=20260824b');
 
   console.log('PASS claims_workspace_ui.test.js');
 })().catch((err) => {
