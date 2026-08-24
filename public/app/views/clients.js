@@ -88,6 +88,20 @@
       options: PLACE_OF_SERVICE_OPTIONS },
     { name: 'default_session_fee', label: 'Default session fee', type: 'number',
       placeholder: 'e.g. 200' },
+    // Present here so that a default which CAN be set (via the session form's
+    // "save as defaults" checkbox, which exposes modifiers) can also be cleared.
+    // A default settable from one screen and clearable from none would be a
+    // one-way door. Same comma-separated → array shaping as the session field;
+    // the backend re-validates and is authoritative.
+    { name: 'default_procedure_modifiers', label: 'Default procedure modifiers', type: 'text',
+      placeholder: '95, GT',
+      hint: 'Optional, comma-separated. Applied to new sessions for this client.',
+      transform: function (v) {
+        return String(v || '')
+          .split(',')
+          .map(function (t) { return t.trim().toUpperCase(); })
+          .filter(Boolean);
+      } },
   ];
 
   // The "New client" form omits date of birth, pronouns, and the full address —
@@ -377,6 +391,9 @@
         default_cpt_code: client.default_cpt_code || '',
         default_place_of_service: client.default_place_of_service || '',
         default_session_fee: client.default_session_fee != null ? client.default_session_fee : '',
+        default_procedure_modifiers: Array.isArray(client.default_procedure_modifiers)
+          ? client.default_procedure_modifiers.join(', ')
+          : '',
         diagnosis_codes: Array.isArray(client.diagnosis_codes) ? client.diagnosis_codes : [],
       },
       submitLabel: 'Save defaults',
@@ -388,6 +405,10 @@
       if (values.default_place_of_service) payload.default_place_of_service = values.default_place_of_service;
       if (values.default_session_fee != null && values.default_session_fee !== '') {
         payload.default_session_fee = values.default_session_fee;
+      }
+      if (Array.isArray(values.default_procedure_modifiers)
+          && values.default_procedure_modifiers.length) {
+        payload.default_procedure_modifiers = values.default_procedure_modifiers;
       }
       var codes = splitCodes(values.diagnosis_codes);
       if (codes.length) payload.diagnosis_codes = codes;

@@ -327,9 +327,11 @@ alter table clients add column if not exists diagnosis_codes text[];
 -- place_of_service, fee and procedure_modifiers all NULL, so every promoted
 -- session still needed billing data typed in by hand before it could become a
 -- claim — the integration saved the scheduling step but none of the billing one.
--- These give those four fields the same per-client default diagnosis_codes has
--- had since migration 008 (which keeps its column name rather than being renamed
--- for symmetry; backend/lib/billing_fields.js maps the two styles in one place).
+-- These add four further per-client default fields, analogous to the diagnosis
+-- default that has existed since migration 008 — each holds its own value, none
+-- derives from diagnosis_codes. That column keeps its name rather than being
+-- renamed for symmetry; backend/lib/billing_fields.js maps the two styles in one
+-- place.
 -- calendar_display_name is PHI — the name the practice's EHR writes into event
 -- titles — used only as one extra comparison form by the calendar matcher.
 -- Declared above for fresh databases; these keep a pre-existing database in
