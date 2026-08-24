@@ -577,12 +577,21 @@
       });
     }
 
-    // Billing row: a saved-card badge (with "Send new link") or a "Send Payment Link"
-    // button. Hidden entirely when there is no phone and no card on file.
+    // Billing row: the card-on-file state and the action that resolves it.
+    //
+    // THREE states, and the third one is the point of this shape: a client with
+    // no phone AND no card used to render nothing at all here, so an unresolved
+    // billing setup was indistinguishable from a finished one — the row simply
+    // wasn't there. It now names the blocker instead of hiding it.
+    //
+    // Weight follows the design system: an OUTSTANDING action wears ink
+    // (btn--primary, full size, not --sm), because getting a card on file is real
+    // work and was previously wearing the quietest button in the app. Once the
+    // card exists the action drops to a quiet ghost and the sage badge carries
+    // the resolved state — sage is earned by resolution, never by pending work.
     function billingRow(client) {
       var hasCard = !!client.payment_method_last4;
       var hasPhone = !!(client.phone && String(client.phone).trim());
-      if (!hasCard && !hasPhone) return null;
 
       var children = [];
 
@@ -600,11 +609,20 @@
             onClick: function () { sendPaymentLink(client); },
           }, 'Send new link'));
         }
-      } else {
+      } else if (hasPhone) {
+        children.push(h('span', { class: 'badge badge--neutral' }, 'No card on file'));
         children.push(h('button', {
-          class: 'btn btn--ghost btn--sm', type: 'button',
+          class: 'btn btn--primary', type: 'button',
           onClick: function () { sendPaymentLink(client); },
-        }, 'Send Payment Link'));
+        }, 'Send payment link'));
+      } else {
+        // No phone on file: POST /clients/{id}/send-payment-link answers 400
+        // ("This client has no phone number on file."), so offering the button
+        // here would only produce a dead end. Name the prerequisite instead.
+        children.push(h('span', { class: 'badge badge--neutral' }, 'No card on file'));
+        children.push(h('span', {
+          style: 'color:var(--color-text-muted);font-size:var(--font-size-2)',
+        }, 'Add a phone number to send a payment link.'));
       }
 
       return h('div', {
@@ -1219,10 +1237,19 @@
         }, [
           h('span', { style: 'color:var(--color-text-muted);font-size:var(--font-size-2)' },
             'Last verified ' + R.fmtDate(record.benefits_checked_at)),
-          h('button', {
-            class: 'btn btn--ghost btn--sm', type: 'button',
-            onClick: function (e) { e.stopPropagation(); showVobResult(s, record, record.benefits_discrepancies); },
-          }, 'View result'),
+          // Both stay GHOST: this record is already resolved, so re-checking it is
+          // an available action, not outstanding work. The ink-outlined treatment
+          // is reserved for vobPromptRow, where the check has never been run.
+          h('div', { style: 'display:flex;align-items:center;gap:var(--space-2)' }, [
+            h('button', {
+              class: 'btn btn--ghost btn--sm', type: 'button',
+              onClick: function (e) { e.stopPropagation(); verifyBenefits(record); },
+            }, 'Re-verify'),
+            h('button', {
+              class: 'btn btn--ghost btn--sm', type: 'button',
+              onClick: function (e) { e.stopPropagation(); showVobResult(s, record, record.benefits_discrepancies); },
+            }, 'View result'),
+          ]),
         ]));
 
         var box = h('div', {
@@ -1234,17 +1261,44 @@
         return h('tr', null, h('td', { colspan: '5', style: 'padding-top:0' }, box));
       }
 
-      // A per-row action cell: Verify / Edit / Delete.
+      // Every insurance record now carries exactly ONE benefits sub-row: either
+      // vobSummaryRow (a stored check) or this prompt (no check yet). Verifying
+      // benefits used to be a 'Verify' ghost button sharing a cell with Edit and
+      // a red Delete — the quietest treatment in the system, on the step that
+      // decides whether a client's OON coverage is even worth billing. It gets
+      // its own row and an ink-outlined button instead.
+      //
+      // Stone throughout: unverified is neutral workflow state, not a failure,
+      // so no danger colour, and no sage until there is a result to be resolved.
+      function vobPromptRow(record) {
+        if (record.benefits_checked_at) return null;
+
+        var box = h('div', {
+          style: 'display:flex;align-items:center;justify-content:space-between;'
+            + 'gap:var(--space-3);flex-wrap:wrap;padding:var(--space-3);'
+            + 'border-radius:var(--radius-2);background:var(--color-surface-sunken)',
+        }, [
+          h('div', { style: 'display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap' }, [
+            h('span', { class: 'badge badge--neutral' }, 'Benefits not verified'),
+            h('span', { style: 'color:var(--color-text-muted);font-size:var(--font-size-2)' },
+              "Check this policy's out-of-network coverage before billing against it."),
+          ]),
+          h('button', {
+            class: 'btn btn--secondary btn--sm', type: 'button',
+            onClick: function (e) { e.stopPropagation(); verifyBenefits(record); },
+          }, 'Verify benefits'),
+        ]);
+
+        return h('tr', null, h('td', { colspan: '5', style: 'padding-top:0' }, box));
+      }
+
+      // A per-row action cell: Edit / Delete. Verifying benefits deliberately does
+      // NOT live here any more — it moved to vobPromptRow / vobSummaryRow, where
+      // it sits next to the state it acts on instead of competing with Delete.
       function insuranceRowActions(record) {
         return h('td', { class: 'data-table__num' }, [
           h('button', {
             class: 'btn btn--ghost btn--sm', type: 'button',
-            onClick: function (e) { e.stopPropagation(); verifyBenefits(record); },
-          }, 'Verify'),
-          ' ',
-          h('button', {
-            class: 'btn btn--ghost btn--sm', type: 'button',
-            style: 'margin-left:var(--space-2)',
             onClick: function (e) { e.stopPropagation(); openForm(record); },
           }, 'Edit'),
           ' ',
@@ -1277,8 +1331,15 @@
           ]));
           var holder = policyholderRow(r);
           if (holder) rows.push(holder);
+          // Mutually exclusive, never both: benefits_raw and benefits_checked_at
+          // are written in the SAME update (backend/handlers/vob.js), so a record
+          // with a summary always has a checked-at, which is exactly what
+          // vobPromptRow refuses on. Both null is possible and fine — a check
+          // whose payload yielded no parseable summary renders no sub-row.
           var summary = vobSummaryRow(r);
           if (summary) rows.push(summary);
+          var prompt = vobPromptRow(r);
+          if (prompt) rows.push(prompt);
           var disc = discrepancyRow(r);
           if (disc) rows.push(disc);
         });
