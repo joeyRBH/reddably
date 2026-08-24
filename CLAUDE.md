@@ -201,6 +201,75 @@ Add or extend a test for the behavior you changed. `backend/tests/onboarding_to_
 walks the critical path (client → intake → clinician confirm → session → claim → submit)
 end to end; if a change touches that chain, it belongs there.
 
+## Handing over shell work (deploys, migrations, one-off ops)
+
+Operational work runs in the user's terminal, not the agent's. Anything that has to
+be run by hand is delivered as **one paste-able script**, never as prose steps the
+user has to sequence themselves.
+
+**Deliver it as a heredoc that WRITES A FILE, then a separate line that runs it:**
+
+```
+cat > /tmp/thing.sh <<'SCRIPT'
+...
+SCRIPT
+bash /tmp/thing.sh
+```
+
+Never hand over a bare multi-line script to paste. The user's shell is zsh, which
+performs HISTORY EXPANSION on `!` in interactive input — so a `#!/usr/bin/env bash`
+shebang fails with `zsh: event not found: /usr/bin/env`, and any `!` inside a
+double-quoted string (`echo "!! stopping"`) fails the same way. The first line then
+errors and the REST OF THE PASTE executes as loose commands, which on a deploy
+script is genuinely dangerous. A QUOTED heredoc delimiter (`<<'SCRIPT'`) suppresses
+all expansion, and `bash file` avoids zsh's parsing entirely.
+
+Rules for that script:
+
+- `set -euo pipefail`, and derive identifiers rather than hardcoding them
+  (`terraform output -raw migrate_function_name`, `git rev-parse --show-toplevel`).
+  A wrong guessed resource name is discovered in production.
+- **Every check is a hard gate that exits non-zero.** A comment saying "confirm this
+  looks right" is not a gate. Parse the actual result (`jq -e '.ok == true'`) and stop.
+- **Explicit confirmation before anything user-facing**, via
+  `read -r ANSWER </dev/tty` — `/dev/tty`, or a pasted block feeds its own remaining
+  lines into the prompt.
+- **When a check cannot run, say so in the output** and name the substitute. Never
+  skip silently: a script that prints nothing looks identical to one that verified
+  everything.
+- **State the expected value inline** (`^^ all three MUST be 0`). The person running
+  it should not need the schema in their head to tell pass from fail.
+- **Close with a rollback line per phase**, and say which phase is the first one that
+  is user-visible.
+
+### Deploy ordering — the fact that makes ordering necessary here
+
+`infra/terraform` builds ONE `archive_file.backend` zip shared by every Lambda
+(`auth`, `migrate`, `backfill`). A plain `terraform apply` updates them together, so
+a schema-dependent handler goes live before the migrate Lambda has applied the
+schema. `infra/terraform/deploy.sh` passes extra args through to `terraform apply`,
+so an ordered rollout is:
+
+```
+./deploy.sh -target=aws_lambda_function.migrate   # migrate function only
+aws lambda invoke --function-name "$(terraform output -raw migrate_function_name)" ...
+<verify>
+./deploy.sh                                       # then the API handlers
+```
+
+Terraform warns that `-target` is for exceptional use; this is that exception.
+NOTE: the `-target` split is reasoned from the terraform source, not yet proven
+against a real apply — correct this section after the first live run.
+
+The Vercel project is **git-linked** to this repo and serves the production domains,
+so **merging to `main` IS the frontend deploy**. It belongs last in any sequence,
+not first. Never describe a merge as inert.
+
+Migrations are applied by the operator, never automatically (`db/README.md`;
+`backend/handlers/migrate.js` is invoked by hand). Every migration file carries its
+own deploy order and verification queries in its header, each with a stated expected
+result.
+
 ## More context
 
 @README.md @db/schema.sql
