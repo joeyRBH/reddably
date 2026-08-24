@@ -228,16 +228,21 @@
   <!-- Shell behavior: auth guard, drawer, user menu, logout. -->
   <script src="./app.js?v=20260717a"></script>
   <!-- Hash router + shared view toolkit (window.Reddably). -->
-  <script src="./views.js?v=20260717a"></script>
+  <script src="./views.js?v=20260824a"></script>
   <!-- Plan state + topbar plan badge (window.ReddablyPlan). -->
   <script src="./plan.js?v=20260715a"></script>
   <!-- Shared calendar workflow classifier (window.Reddably.workflow) — must load
        after views.js creates the namespace and before Dashboard and Calendar. -->
   <script src="./workflow.js?v=20260810a"></script>
+
+  <!-- Shared "save as client defaults" rules (field-limited payload + the
+       partial-success contract), used by every form that edits a defaultable
+       field. Must load after views.js, which creates window.Reddably. -->
+  <script src="./client-defaults.js?v=20260824a"></script>
   <!-- Views (register into the router). -->
   <script src="./views/dashboard.js?v=20260728c"></script>
-  <script src="./views/clients.js?v=20260715a"></script>
-  <script src="./views/claims.js?v=20260728b"></script>
+  <script src="./views/clients.js?v=20260824a"></script>
+  <script src="./views/claims.js?v=20260824a"></script>
   <script src="./views/calendar.js?v=20260728c"></script>
   <script src="./views/clinicians.js?v=20260715a"></script>
   <script src="./views/reports.js?v=20260715a"></script>

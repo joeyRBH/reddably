@@ -321,6 +321,51 @@ async function testIgnoreThenPromote() {
   console.log('PASS ignore is reversible via promote; a confirmed event cannot be ignored');
 }
 
+
+// --- test 7: the promoted session is SEEDED from the client's billing defaults --
+// The point of per-client defaults. Before them, promotion inserted a session
+// with cpt_code / place_of_service / fee / procedure_modifiers all NULL, so the
+// clinician could not "just verify the appointment" — every promoted session
+// needed billing data typed in before it could become a submittable claim.
+async function testPromoteSeedsBillingDefaults() {
+  reset();
+  const client = state.clients.find((c) => c.id === CLIENT_ID);
+  client.default_cpt_code = '90837';
+  client.default_place_of_service = '10';
+  client.default_session_fee = '175.00';
+  client.default_procedure_modifiers = ['95'];
+
+  const res = await handler(promoteRequest(EVENT_ID, CLIENT_ID));
+  assert.strictEqual(res.statusCode, 201, res.body);
+
+  const s = state.sessions[0];
+  assert.strictEqual(s.cpt_code, '90837', 'CPT is seeded');
+  assert.strictEqual(s.place_of_service, '10', 'place of service is seeded');
+  assert.strictEqual(s.fee, '175.00', 'fee is seeded');
+  assert.deepStrictEqual(s.procedure_modifiers, ['95'], 'modifiers are seeded');
+  assert.deepStrictEqual(s.diagnosis_codes, ['F411'],
+    'diagnosis still carries over, as it always did');
+  console.log('PASS a promoted session is seeded from the client billing defaults');
+}
+
+// --- test 8: a client with NO defaults promotes exactly as it used to -----------
+// The seeding only ever fills a blank. A practice that never sets a default must
+// see byte-identical behaviour to before the feature existed.
+async function testPromoteWithoutDefaultsIsUnchanged() {
+  reset();
+  const res = await handler(promoteRequest(EVENT_ID, CLIENT_ID));
+  assert.strictEqual(res.statusCode, 201, res.body);
+
+  const s = state.sessions[0];
+  assert.ok(s.cpt_code == null, 'no CPT');
+  assert.ok(s.place_of_service == null, 'no place of service');
+  assert.ok(s.fee == null, 'no fee');
+  assert.ok(s.procedure_modifiers == null, 'no modifiers');
+  assert.deepStrictEqual(s.diagnosis_codes, ['F411'],
+    'diagnosis still carries over — that default predates the others');
+  console.log('PASS a client with no defaults promotes exactly as before');
+}
+
 (async function main() {
   await testPromoteCreatesSession();
   await testSessionDateUsesCalendarZone();
@@ -328,6 +373,8 @@ async function testIgnoreThenPromote() {
   await testCancelledEventRejected();
   await testForeignClientRejected();
   await testIgnoreThenPromote();
+  await testPromoteSeedsBillingDefaults();
+  await testPromoteWithoutDefaultsIsUnchanged();
   console.log('PASS calendar_promote.test.js');
 })().catch((err) => {
   console.error('FAIL calendar_promote.test.js');

@@ -637,15 +637,24 @@
           R.toast('Underlying session not found', 'error');
           return;
         }
+        // Ticking the box saves the defaultable fields THIS FORM EXPOSES back onto
+        // the client — dx, CPT and fee only. Place of service and modifiers are
+        // not on this form, so they are absent from the defaults request rather
+        // than sent as null: a claim edit can never blank a default it never
+        // showed. Never pre-ticked; it is an explicit instruction each time.
+        var saveDefaults = false;
+        var editFields = [
+          { name: 'session_date',   label: 'Session date',   type: 'date', required: true },
+          { name: 'cpt_code',       label: 'CPT code',       type: 'text' },
+          { name: 'diagnosis_codes', label: 'Diagnosis code(s)', type: 'diagnosis',
+            placeholder: 'Search code or condition (e.g. F411 or anxiety)…' },
+          { name: 'fee',            label: 'Rate / fee',     type: 'number' },
+          R.clientDefaults.checkboxField(claim.client_name, function (on) { saveDefaults = on; }),
+        ];
+
         R.formModal({
           title: 'Edit claim',
-          fields: [
-            { name: 'session_date',   label: 'Session date',   type: 'date', required: true },
-            { name: 'cpt_code',       label: 'CPT code',       type: 'text' },
-            { name: 'diagnosis_codes', label: 'Diagnosis code(s)', type: 'diagnosis',
-              placeholder: 'Search code or condition (e.g. F411 or anxiety)…' },
-            { name: 'fee',            label: 'Rate / fee',     type: 'number' },
-          ],
+          fields: editFields,
           values: {
             session_date: session.session_date ? String(session.session_date).slice(0, 10) : '',
             cpt_code: session.cpt_code || '',
@@ -663,12 +672,33 @@
             fee: values.fee,                     // null clears it
             diagnosis_codes: codes,              // [] clears them
           };
-          api.sessions.update(session.id, payload).then(function () {
-            // Regenerate billed amount etc. from the updated session, server-side.
-            return api.claims.regenerate(claim.id);
-          }).then(function () {
-            R.toast('Claim updated from session', 'success');
-            load();
+          // The session write + regenerate is the AUTHORITATIVE half and runs
+          // first; the defaults write is strictly secondary and its failure is
+          // caught inside submitWithDefaults, so it can never reach the .catch
+          // below and be reported as a failed claim edit.
+          //
+          // NOTE: the regenerate step's own failure handling is UNCHANGED and
+          // deliberately so. If sessions.update succeeds and regenerate fails,
+          // this .catch still shows a bare error and load() never runs, so the
+          // screen keeps showing stale values even though the session write
+          // landed. That is pre-existing behaviour (it predates client
+          // defaults); it is pinned by claims_regenerate_lifecycle.test.js and
+          // is being fixed as its own scoped change rather than opportunistically
+          // altered here.
+          R.clientDefaults.submitWithDefaults({
+            write: function () {
+              return api.sessions.update(session.id, payload).then(function () {
+                // Regenerate billed amount etc. from the updated session, server-side.
+                return api.claims.regenerate(claim.id);
+              });
+            },
+            saveDefaults: saveDefaults,
+            clientId: claim.client_id,
+            payload: payload,
+            fieldNames: editFields.map(function (f) { return f.name; }),
+            successMessage: 'Claim updated from session',
+            partialMessage: 'Claim updated, but client defaults could not be saved.',
+            onSettled: load,
           }).catch(function (err) {
             R.toast(err.message, 'error');
           });
