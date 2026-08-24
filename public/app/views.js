@@ -604,7 +604,7 @@
     return { node: node, control: hidden };
   }
 
-  // formModal({ title, fields, values, submitLabel }) -> Promise<values|null>
+  // formModal({ title, fields, values, submitLabel, cancelLabel }) -> Promise<values|null>
   //   fields: [{ name, label, type, required, options, placeholder }]
   //   types: text | email | date | number | select | textarea | payer (default text)
   function formModal(opts) {
@@ -826,7 +826,11 @@
         return ok ? out : null;
       }
 
-      var cancelBtn = h('button', { class: 'btn btn--ghost', type: 'button' }, 'Cancel');
+      // cancelLabel mirrors confirmModal's existing option. It matters for a
+      // form that is one skippable step of a chain: 'Cancel' there reads as
+      // undoing what came before, when it only means 'not now'.
+      var cancelBtn = h('button', { class: 'btn btn--ghost', type: 'button' },
+        opts.cancelLabel || 'Cancel');
       var submitBtn = h('button', { class: 'btn btn--primary', type: 'submit' },
         opts.submitLabel || 'Save');
 

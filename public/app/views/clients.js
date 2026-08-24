@@ -57,6 +57,53 @@
       options: ['awaiting_info', 'active', 'inactive'] },
   ];
 
+  // CMS two-character place-of-service codes (837P 2300/CLM05-01), listed once
+  // and shared by the session form and the per-client default below — two copies
+  // would be two lists that could disagree about what is billable. The backend
+  // re-validates against lib/place_of_service.js and is authoritative; the empty
+  // option means "not set" (the 837P builder then defaults it to 11 — Office).
+  var PLACE_OF_SERVICE_OPTIONS = [
+    { value: '',   label: 'Not set' },
+    { value: '02', label: '02 — Telehealth (patient not in their home)' },
+    { value: '10', label: '10 — Telehealth (patient in their home)' },
+    { value: '11', label: '11 — Office' },
+    { value: '12', label: '12 — Home' },
+    { value: '49', label: '49 — Independent clinic' },
+    { value: '53', label: '53 — Community mental health center' },
+  ];
+
+  // The per-client billing defaults, seeded onto every new session (calendar
+  // promote + manual create) so a promoted appointment arrives billable instead
+  // of blank. Defined once and used by BOTH the Edit-client form and the
+  // onboarding "claim defaults" step, so the two can never offer different sets.
+  //
+  // diagnosis_codes is the fifth member of this set but lives in CLIENT_FIELDS
+  // above: it predates the others (migration 008) and is already positioned
+  // there. See CLIENT_DEFAULT_COLUMNS in backend/lib/billing_fields.js.
+  var BILLING_DEFAULT_FIELDS = [
+    { name: 'default_cpt_code', label: 'Default CPT code', type: 'text',
+      placeholder: 'e.g. 90837',
+      hint: 'Applied to new sessions for this client. Always overridable per session.' },
+    { name: 'default_place_of_service', label: 'Default place of service', type: 'select',
+      options: PLACE_OF_SERVICE_OPTIONS },
+    { name: 'default_session_fee', label: 'Default session fee', type: 'number',
+      placeholder: 'e.g. 200' },
+    // Present here so that a default which CAN be set (via the session form's
+    // "save as defaults" checkbox, which exposes modifiers) can also be cleared.
+    // A default settable from one screen and clearable from none would be a
+    // one-way door. Same comma-separated → array shaping as the session field;
+    // the backend re-validates and is authoritative.
+    { name: 'default_procedure_modifiers', label: 'Default procedure modifiers', type: 'text',
+      placeholder: '95, GT',
+      hint: 'Optional, comma-separated. Applied to new sessions for this client.',
+      transform: function (v) {
+        return String(v || '')
+          .split(',')
+          .map(function (t) { return t.trim().toUpperCase(); })
+          .filter(Boolean);
+      } },
+  ];
+
   // The "New client" form omits date of birth, pronouns, and the full address —
   // the client supplies all of these themselves in the SMS intake ("Your
   // information" step), keeping PHI entry with the client and the New-client form
@@ -70,6 +117,23 @@
   var CREATE_CLIENT_FIELDS = CLIENT_FIELDS.filter(function (f) {
     return CREATE_ONLY_OMITTED.indexOf(f.name) === -1;
   });
+
+  // The Edit-client form is the base fields PLUS the billing defaults. This is
+  // the one place a default can be CLEARED — every other surface that writes a
+  // default (the session form's checkbox, the Edit-claim checkbox, onboarding
+  // step 3) only ever writes non-empty values, deliberately, so that blanking one
+  // session's CPT can never destroy the client's default as a side effect. Here
+  // the default itself is the visible subject of the edit, so clearing it means
+  // what it says.
+  //
+  // The New-client form does not carry them: they are step 3 of onboarding,
+  // where they get a screen of their own and an explanation of what they do.
+  var EDIT_CLIENT_FIELDS = CLIENT_FIELDS.concat(BILLING_DEFAULT_FIELDS, [
+    { name: 'calendar_display_name', label: 'Name in calendar appointments', type: 'text',
+      hint: 'Only needed when this client appears in calendar titles under a '
+        + 'different name. Used to match appointments; a match still never '
+        + 'schedules anything without your confirmation.' },
+  ]);
 
   // A patient is a dependent (not the policyholder) when the stored relationship
   // is present and something other than 'self'. The 837P builder puts such a
@@ -150,15 +214,7 @@
     // The backend re-validates against the same list and is authoritative; the
     // empty option means "not set" (the 837P builder defaults it to 11 — Office).
     { name: 'place_of_service', label: 'Place of service', type: 'select',
-      options: [
-        { value: '',   label: 'Not set' },
-        { value: '02', label: '02 — Telehealth (patient not in their home)' },
-        { value: '10', label: '10 — Telehealth (patient in their home)' },
-        { value: '11', label: '11 — Office' },
-        { value: '12', label: '12 — Home' },
-        { value: '49', label: '49 — Independent clinic' },
-        { value: '53', label: '53 — Community mental health center' },
-      ] },
+      options: PLACE_OF_SERVICE_OPTIONS },
     { name: 'procedure_modifiers', label: 'Procedure modifiers', type: 'text',
       placeholder: '95, GT',
       hint: 'Optional payer-required modifiers, comma-separated. Example: 95 for ' +
@@ -277,6 +333,153 @@
   }
 
   // ===========================================================================
+  // Client onboarding — the steps that follow "New client"
+  // ===========================================================================
+  // Adding a client is step one of four, and the other three used to be chores
+  // the user had to remember and go find: send the card-capture link, set the
+  // billing defaults, and attach the client to their calendar appointments.
+  //
+  // Each step is skippable and nothing is lost by skipping — every one is just
+  // an ordinary authenticated write that the chart offers again through
+  // setupChecklistCard(). The flow exists to put the steps in front of the user
+  // at the moment they are cheapest, not to gate anything.
+  //
+  // Ordering is deliberate: defaults BEFORE calendar matching, because matching
+  // an appointment promotes it to a session immediately and that session is
+  // seeded from the defaults. Matching first would produce a blank session and
+  // waste the step.
+
+  // Step 2 — the SMS card-capture link. Offered only when a phone is on file:
+  // POST /clients/{id}/send-payment-link answers 400 without one.
+  function onboardingPaymentLink(client) {
+    if (!client || !client.phone) return Promise.resolve();
+    return R.confirmModal({
+      title: 'Send the payment link?',
+      body: h('div', { class: 'stack', style: 'gap:var(--space-2)' }, [
+        h('p', { style: 'margin:0' },
+          'Text ' + clientName(client) + ' a secure link to save a card. '
+          + 'The per-claim fee is charged to that card.'),
+        h('p', { style: 'margin:0;color:var(--color-text-muted);font-size:var(--font-size-2)' },
+          'Sending to ' + client.phone + '. You can also send it later from their chart.'),
+      ]),
+      confirmLabel: 'Send link',
+      cancelLabel: 'Skip for now',
+    }).then(function (ok) {
+      if (!ok) return;
+      return api.clients.sendPaymentLink(client.id).then(function () {
+        R.toast('Payment link sent', 'success');
+      }).catch(function (err) {
+        // A failed send must not abort onboarding — the chart will offer it again.
+        R.toast((err && err.message) || 'Could not send payment link', 'error');
+      });
+    });
+  }
+
+  // Step 3 — the billing defaults. This is the step that makes "just verify the
+  // appointment" true: without it a calendar-promoted session arrives with no
+  // CPT, no place of service and no fee, and has to be filled in by hand before
+  // it can become a claim.
+  function onboardingDefaults(client) {
+    if (!client) return Promise.resolve(client);
+    return R.formModal({
+      title: 'Claim defaults for ' + clientName(client),
+      fields: BILLING_DEFAULT_FIELDS.concat([
+        { name: 'diagnosis_codes', label: 'Default diagnosis code(s)', type: 'diagnosis',
+          placeholder: 'Search code or condition (e.g. F411 or anxiety)…' },
+      ]),
+      values: {
+        default_cpt_code: client.default_cpt_code || '',
+        default_place_of_service: client.default_place_of_service || '',
+        default_session_fee: client.default_session_fee != null ? client.default_session_fee : '',
+        default_procedure_modifiers: Array.isArray(client.default_procedure_modifiers)
+          ? client.default_procedure_modifiers.join(', ')
+          : '',
+        diagnosis_codes: Array.isArray(client.diagnosis_codes) ? client.diagnosis_codes : [],
+      },
+      submitLabel: 'Save defaults',
+      cancelLabel: 'Skip for now',
+    }).then(function (values) {
+      if (!values) return client;
+      var payload = {};
+      if (values.default_cpt_code) payload.default_cpt_code = values.default_cpt_code;
+      if (values.default_place_of_service) payload.default_place_of_service = values.default_place_of_service;
+      if (values.default_session_fee != null && values.default_session_fee !== '') {
+        payload.default_session_fee = values.default_session_fee;
+      }
+      if (Array.isArray(values.default_procedure_modifiers)
+          && values.default_procedure_modifiers.length) {
+        payload.default_procedure_modifiers = values.default_procedure_modifiers;
+      }
+      var codes = splitCodes(values.diagnosis_codes);
+      if (codes.length) payload.diagnosis_codes = codes;
+      if (!Object.keys(payload).length) return client;
+
+      return api.clients.update(client.id, payload).then(function (res) {
+        R.toast('Defaults saved', 'success');
+        return (res && res.client) || client;
+      }).catch(function (err) {
+        R.toast((err && err.message) || 'Could not save defaults', 'error');
+        return client;
+      });
+    });
+  }
+
+  // Step 4 — attach this client to appointments already on the calendar.
+  //
+  // Matching PROMOTES the event to a scheduled session (seeded from the defaults
+  // just set), which is why it runs last. Only unpromoted, non-cancelled events
+  // are offered. A silent no-op when no calendar is connected or nothing is
+  // waiting — an empty step should not cost the user a click.
+  function onboardingCalendar(client) {
+    if (!client) return Promise.resolve();
+    return api.calendarEvents.list().then(function (res) {
+      var events = ((res && res.calendar_events) || []).filter(function (ev) {
+        return ev && !ev.session_id && ev.event_status !== 'cancelled';
+      });
+      if (!events.length) return;
+
+      var options = events.slice(0, 25).map(function (ev) {
+        return {
+          value: ev.id,
+          label: R.fmtDate(ev.starts_at) + ' · ' + (ev.summary_raw || 'Untitled appointment'),
+        };
+      });
+
+      return R.formModal({
+        title: 'Match an appointment to ' + clientName(client),
+        fields: [
+          { name: 'event_id', label: 'Appointment', type: 'select',
+            options: [{ value: '', label: '— none —' }].concat(options),
+            hint: 'Matching schedules the session, using the defaults you just set. '
+              + 'You can match the rest from Calendar.' },
+        ],
+        submitLabel: 'Match appointment',
+        cancelLabel: 'Skip for now',
+      }).then(function (values) {
+        if (!values || !values.event_id) return;
+        return api.calendarEvents.promote(values.event_id, client.id).then(function () {
+          R.toast('Appointment matched — session scheduled', 'success');
+        }).catch(function (err) {
+          R.toast((err && err.message) || 'Could not match this appointment.', 'error');
+        });
+      });
+    }).catch(function () {
+      // No calendar connected (404) or the list failed — never block onboarding
+      // on an integration the practice may not use.
+    });
+  }
+
+  // The whole chain. Always resolves: a step that fails or is skipped simply
+  // hands off to the next one, and the chart's checklist picks up the remainder.
+  function runOnboarding(client) {
+    if (!client) return Promise.resolve();
+    return onboardingPaymentLink(client)
+      .then(function () { return onboardingDefaults(client); })
+      .then(function (updated) { return onboardingCalendar(updated || client); })
+      .catch(function () { /* onboarding is best-effort by design */ });
+  }
+
+  // ===========================================================================
   // Screen 1 — Client list (#clients)
   // ===========================================================================
   function renderClientList(root) {
@@ -298,9 +501,14 @@
         submitLabel: 'Create client',
       }).then(function (values) {
         if (!values) return;
-        api.clients.create(buildClientPayload(values, false)).then(function () {
+        api.clients.create(buildClientPayload(values, false)).then(function (res) {
           R.toast('Client created', 'success');
-          load();
+          var created = res && res.client;
+          // Straight into the rest of setup rather than dropping the user back on
+          // a list with three more chores they have to remember. Bailing out at
+          // any step is fine and loses nothing: the chart's setup checklist shows
+          // whatever is still outstanding and reopens the flow at that point.
+          return runOnboarding(created).then(load);
         }).catch(function (err) {
           R.toast(err.message, 'error');
         });
@@ -446,7 +654,7 @@
     function openEdit(client) {
       R.formModal({
         title: 'Edit client',
-        fields: CLIENT_FIELDS,
+        fields: EDIT_CLIENT_FIELDS,
         values: client,
         submitLabel: 'Save changes',
       }).then(function (values) {
@@ -751,6 +959,98 @@
               meta.join('  ·  '))
           : null,
         billingRow(client),
+      ]);
+    }
+
+    // --- Setup checklist ------------------------------------------------------
+    // What is still outstanding for this client, and the action that resolves
+    // each item. This is the other half of the onboarding chain: bailing out of
+    // that flow costs nothing because everything it offered is offered again
+    // here, in place, for as long as it is still outstanding.
+    //
+    // The whole card disappears once every item is done — a checklist of ticks
+    // is a nag, not information. Stone throughout: outstanding setup is neutral
+    // workflow state, never a failure, so nothing here is danger-coloured and
+    // nothing is sage until it is genuinely resolved.
+    function setupChecklistCard(client, insurance) {
+      if (!client) return null;
+
+      var hasCard = !!client.payment_method_last4;
+      var hasPhone = !!(client.phone && String(client.phone).trim());
+      var hasDefaults = !!(client.default_cpt_code || client.default_session_fee != null
+        || client.default_place_of_service);
+      var records = (insurance || []).filter(function (r) { return !r.is_hidden; });
+      var hasInsurance = records.length > 0;
+
+      var items = [];
+
+      if (!hasCard) {
+        items.push({
+          label: 'Save a card for the per-claim fee',
+          // Without a phone the send endpoint 400s, so name the prerequisite
+          // rather than offering a button that cannot work.
+          note: hasPhone ? null : 'Add a phone number first.',
+          actionLabel: hasPhone ? 'Send payment link' : null,
+          onAction: hasPhone ? function () {
+            api.clients.sendPaymentLink(client.id).then(function () {
+              R.toast('Payment link sent', 'success');
+              load();
+            }).catch(function (err) {
+              R.toast((err && err.message) || 'Could not send payment link', 'error');
+            });
+          } : null,
+        });
+      }
+
+      if (!hasInsurance) {
+        items.push({
+          label: 'Add an insurance policy',
+          note: 'A claim cannot be submitted without one.',
+        });
+      }
+
+      if (!hasDefaults) {
+        items.push({
+          label: 'Set claim defaults',
+          note: 'Without these, every appointment matched from the calendar '
+            + 'arrives with no CPT code, place of service or fee.',
+          actionLabel: 'Set defaults',
+          onAction: function () { onboardingDefaults(client).then(load); },
+        });
+      }
+
+      if (!items.length) return null;
+
+      var rows = items.map(function (item) {
+        var right = item.actionLabel
+          ? h('button', {
+            class: 'btn btn--secondary btn--sm', type: 'button',
+            onClick: item.onAction,
+          }, item.actionLabel)
+          : null;
+        return h('div', {
+          style: 'display:flex;align-items:flex-start;justify-content:space-between;'
+            + 'gap:var(--space-3);flex-wrap:wrap',
+        }, [
+          h('div', { class: 'stack', style: 'gap:var(--space-1)' }, [
+            h('span', null, item.label),
+            item.note
+              ? h('span', {
+                style: 'color:var(--color-text-muted);font-size:var(--font-size-2);max-width:60ch',
+              }, item.note)
+              : null,
+          ]),
+          right,
+        ]);
+      });
+
+      return h('div', { class: 'card' }, [
+        h('div', { class: 'card__header' }, [
+          h('h2', { class: 'card__title' }, 'Finish setting up'),
+          h('span', { class: 'badge badge--neutral' },
+            items.length + (items.length === 1 ? ' item left' : ' items left')),
+        ]),
+        h('div', { class: 'stack', style: 'gap:var(--space-3)' }, rows),
       ]);
     }
 
@@ -1447,6 +1747,15 @@
               : [];
           }
 
+          // Ticking the box saves the defaultable fields THIS FORM EXPOSES back
+          // onto the client, so the correction a clinician makes here becomes the
+          // seed for every future session instead of being re-typed each time.
+          // Never pre-ticked — it is an explicit instruction on each attempt.
+          var saveDefaults = false;
+          sessionFields = sessionFields.concat([
+            R.clientDefaults.checkboxField(clientName(client), function (on) { saveDefaults = on; }),
+          ]);
+
           R.formModal({
             title: session ? 'Edit session' : 'Add session',
             fields: sessionFields,
@@ -1472,30 +1781,45 @@
               payload.recurrence_end_date = result.recurrence_end_date;
             }
 
+            var fieldNames = sessionFields.map(function (f) { return f.name; });
+
             if (session) {
               // client_id is immutable on a session — the PATCH endpoint rejects
               // any body that carries it (400), so an edit must never send it.
-              api.sessions.update(session.id, payload).then(function (res) {
-                // Completing a session auto-drafts a claim server-side.
-                if (res && res.claim_created) {
-                  R.toast('Draft claim created — review in Claims.', 'success');
-                } else {
-                  R.toast('Session updated', 'success');
-                }
-                reload();
+              R.clientDefaults.submitWithDefaults({
+                write: function () { return api.sessions.update(session.id, payload); },
+                saveDefaults: saveDefaults,
+                clientId: id,
+                payload: payload,
+                fieldNames: fieldNames,
+                // Completing a session auto-drafts a claim server-side, so what
+                // happened is only knowable from the response.
+                successMessage: function (res) {
+                  return (res && res.claim_created)
+                    ? 'Draft claim created — review in Claims.'
+                    : 'Session updated';
+                },
+                partialMessage: 'Session updated, but client defaults could not be saved.',
+                onSettled: reload,
               }).catch(function (err) {
                 R.toast(err.message, 'error');
               });
             } else {
               // Create attaches the session to this client.
               payload.client_id = id;
-              api.sessions.create(payload).then(function (res) {
-                if (res && res.count && res.count > 1) {
-                  R.toast(res.count + ' sessions scheduled', 'success');
-                } else {
-                  R.toast('Session added', 'success');
-                }
-                reload();
+              R.clientDefaults.submitWithDefaults({
+                write: function () { return api.sessions.create(payload); },
+                saveDefaults: saveDefaults,
+                clientId: id,
+                payload: payload,
+                fieldNames: fieldNames,
+                successMessage: function (res) {
+                  return (res && res.count && res.count > 1)
+                    ? res.count + ' sessions scheduled'
+                    : 'Session added';
+                },
+                partialMessage: 'Session added, but client defaults could not be saved.',
+                onSettled: reload,
               }).catch(function (err) {
                 R.toast(err.message, 'error');
               });
@@ -1573,6 +1897,9 @@
         backLink(),
         intakeReviewBanner(client, insurance),
         headerCard(client, insurance),
+        // Below the header (who this is) and above insurance/sessions (the work),
+        // because it is about getting this client ready rather than about them.
+        setupChecklistCard(client, insurance),
         insurancePanel(client, insurance),
         sessionsPanel(client, sessions),
       ]);

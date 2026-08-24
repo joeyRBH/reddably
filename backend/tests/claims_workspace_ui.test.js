@@ -454,8 +454,8 @@ function plain(v) {
 
   // 15. The cache-buster for this view was bumped.
   const appHtml = fs.readFileSync(path.join(__dirname, '..', '..', 'public', 'app', 'app.html'), 'utf8');
-  assert.match(appHtml, /\.\/views\/claims\.js\?v=20260728b/,
-    'app.html serves claims.js?v=20260728b');
+  assert.match(appHtml, /\.\/views\/claims\.js\?v=20260824a/,
+    'app.html serves claims.js?v=20260824a');
 
   console.log('PASS claims_workspace_ui.test.js');
 })().catch((err) => {

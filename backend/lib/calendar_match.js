@@ -27,6 +27,7 @@
 
 // Confidence tiers, most to least specific.
 const CONFIDENCE = {
+  calendar_display_name: 100,
   full_name: 100,
   first_name_last_initial: 90,
   first_initial_last_name: 90,
@@ -78,6 +79,22 @@ function bestForCandidate(titleTokens, candidate) {
   if (candidate.preferred_name) variants.push(candidate.preferred_name);
 
   let best = null;
+
+  // The name this client appears under in the practice EHR's calendar titles,
+  // when the practice recorded one. Compared VERBATIM as a leading match rather
+  // than being decomposed into first/last forms: it exists precisely BECAUSE the
+  // title does not resolve to this client's first and last name, so re-deriving
+  // those four forms from it would reintroduce the mismatch it was recorded to
+  // fix. Top confidence, since it is an explicit human statement of identity
+  // rather than an inference — but still only a SUGGESTION: ambiguity below is
+  // still fatal, and promotion still requires human confirmation.
+  if (candidate.calendar_display_name) {
+    const form = tokens(candidate.calendar_display_name);
+    if (form.length && leadingMatch(titleTokens, form)) {
+      best = { confidence: CONFIDENCE.calendar_display_name, reason: 'calendar_display_name' };
+    }
+  }
+
   for (const first of variants) {
     for (const { reason, form } of formsFor(first, candidate.last_name)) {
       if (!leadingMatch(titleTokens, form)) continue;
@@ -95,8 +112,8 @@ function bestForCandidate(titleTokens, candidate) {
 //                                                          highest tier found
 //   null                                                   nothing matched
 //
-// candidates: [{ id, first_name, last_name, preferred_name }] — the practice's
-// active clients.
+// candidates: [{ id, first_name, last_name, preferred_name, calendar_display_name }]
+// — the practice's active clients.
 function matchEvent(summaryRaw, candidates) {
   const titleTokens = tokens(summaryRaw);
   if (titleTokens.length === 0) return null;

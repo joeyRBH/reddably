@@ -192,7 +192,7 @@ async function matchUnmatchedEvents(conn) {
   if (pending.rowCount === 0) return;
 
   const candidates = await db.query(
-    `select id, first_name, last_name, preferred_name from clients
+    `select id, first_name, last_name, preferred_name, calendar_display_name from clients
       where practice_id = $1 and is_hidden = false and status <> 'inactive'`,
     [conn.practice_id]
   );

@@ -149,7 +149,7 @@ dbLib.query = async (text, params) => {
     );
     return { rows, rowCount: rows.length };
   }
-  if (/select id, first_name, last_name, preferred_name from clients/.test(t)) {
+  if (/select id, first_name, last_name, preferred_name, calendar_display_name from clients/.test(t)) {
     return { rows: state.clients, rowCount: state.clients.length };
   }
   if (/update calendar_events\s+set match_state = 'matched'/.test(t)) {

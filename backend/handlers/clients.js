@@ -20,6 +20,15 @@ const { requireAuth } = require('../lib/auth');
 const { json, preflight } = require('../lib/response');
 const { normalizeEmail, normalizePhone, parseBody } = require('../lib/util');
 const { audit, sanitizeFields } = require('../lib/audit');
+// Same parsers the sessions handler uses, so a value stored as a client DEFAULT
+// is validated exactly as it would be on the session itself — a default that
+// could not legally sit on a session would otherwise seed an unsubmittable claim.
+const {
+  parseMoney,
+  parseProcedureModifiers,
+  parsePlaceOfService,
+  placeOfServiceError,
+} = require('../lib/billing_fields');
 
 // Allowed client.status values — mirror the CHECK constraint in db/schema.sql.
 // 'active' == ready for claim submission. Keep in sync with the CHECK in
@@ -104,6 +113,48 @@ function isValidDate(s) {
 // of non-empty trimmed strings, at most MAX_DIAGNOSIS_CODES. An empty array clears
 // the column (stored as null). Mirrors the sessions handler's parser so a client's
 // default codes and a session's codes are validated identically.
+// Validate the per-client billing defaults present on a request body. Returns
+// { ok:true, value:{...columns} } with a null for every key the body did not
+// carry, or { ok:false, error } naming the first offending field.
+//
+// Every value goes through the SAME parser the sessions handler applies to the
+// session's own column (lib/billing_fields.js). A default that could not legally
+// sit on a session must not be storable as a default either — otherwise the
+// first calendar-promoted appointment seeds an unsubmittable claim, and the
+// error surfaces at submit time against a payer rather than here against a form.
+function parseBillingDefaults(body) {
+  const value = {
+    default_cpt_code: null,
+    default_place_of_service: null,
+    default_session_fee: null,
+    default_procedure_modifiers: null,
+    calendar_display_name: null,
+  };
+
+  if ('default_cpt_code' in body) value.default_cpt_code = cleanText(body.default_cpt_code);
+  if ('calendar_display_name' in body) value.calendar_display_name = cleanText(body.calendar_display_name);
+
+  if ('default_place_of_service' in body) {
+    const pos = parsePlaceOfService(body.default_place_of_service);
+    if (!pos.ok) return { ok: false, error: placeOfServiceError().replace('place_of_service', 'default_place_of_service') };
+    value.default_place_of_service = pos.value;
+  }
+  if ('default_session_fee' in body) {
+    const fee = parseMoney(body.default_session_fee);
+    if (!fee.ok) return { ok: false, error: 'Invalid default_session_fee. Expected a number >= 0.' };
+    value.default_session_fee = fee.value;
+  }
+  if ('default_procedure_modifiers' in body) {
+    const mods = parseProcedureModifiers(body.default_procedure_modifiers);
+    if (!mods.ok) {
+      return { ok: false, error: 'Invalid default_procedure_modifiers. Expected an array of up to 4 two-character alphanumeric codes.' };
+    }
+    value.default_procedure_modifiers = mods.value;
+  }
+
+  return { ok: true, value };
+}
+
 function parseDiagnosisCodes(v) {
   if (v == null) return { ok: true, value: null };
   if (!Array.isArray(v)) return { ok: false };
@@ -145,6 +196,14 @@ function shapeClient(r) {
     postal_code: r.postal_code,
     country: r.country,
     diagnosis_codes: r.diagnosis_codes,
+    // Per-client billing defaults seeded onto new sessions (calendar promote +
+    // manual create). diagnosis_codes above is the fifth member of this set — it
+    // predates the others and kept its column name.
+    default_cpt_code: r.default_cpt_code,
+    default_place_of_service: r.default_place_of_service,
+    default_session_fee: r.default_session_fee,
+    default_procedure_modifiers: r.default_procedure_modifiers,
+    calendar_display_name: r.calendar_display_name,
     status: r.status,
     // Display-only payment-method summary (never the Stripe customer / PM ids).
     payment_method_brand: r.payment_method_brand,
@@ -227,13 +286,18 @@ async function createClient(practiceId, body, event, authCtx) {
     return json(400, { error: 'Invalid phone number. Enter a valid US phone number.' }, event);
   }
 
+  const defaults = parseBillingDefaults(body);
+  if (!defaults.ok) return json(400, { error: defaults.error }, event);
+
   const res = await db.query(
     `insert into clients
        (practice_id, first_name, last_name, preferred_name, pronouns, email, phone,
         date_of_birth, gender, address_line1, address_line2, city, state, postal_code,
-        diagnosis_codes, primary_clinician_id, status)
+        diagnosis_codes, primary_clinician_id, status,
+        default_cpt_code, default_place_of_service, default_session_fee,
+        default_procedure_modifiers, calendar_display_name)
      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-             coalesce($17, 'awaiting_info'))
+             coalesce($17, 'awaiting_info'), $18, $19, $20, $21, $22)
      returning *`,
     [
       practiceId,
@@ -253,6 +317,11 @@ async function createClient(practiceId, body, event, authCtx) {
       dx.value,
       primaryClinicianId,
       status,
+      defaults.value.default_cpt_code,
+      defaults.value.default_place_of_service,
+      defaults.value.default_session_fee,
+      defaults.value.default_procedure_modifiers,
+      defaults.value.calendar_display_name,
     ]
   );
 
@@ -386,6 +455,24 @@ async function updateClient(practiceId, id, body, event, authCtx) {
       return json(400, { error: `Invalid status. Expected one of: ${ALLOWED_STATUSES.join(', ')}` }, event);
     }
     add('status', status);
+  }
+
+  // Per-client billing defaults. Each is written ONLY when the request actually
+  // carries that key, so a PATCH that names one default cannot blank the other
+  // four — the "save these as defaults" control on the session and claim forms
+  // sends exactly the fields that form exposes and nothing else, and this is the
+  // server-side half of that guarantee.
+  for (const key of [
+    'default_cpt_code',
+    'default_place_of_service',
+    'default_session_fee',
+    'default_procedure_modifiers',
+    'calendar_display_name',
+  ]) {
+    if (!(key in body)) continue;
+    const parsed = parseBillingDefaults({ [key]: body[key] });
+    if (!parsed.ok) return json(400, { error: parsed.error }, event);
+    add(key, parsed.value[key]);
   }
 
   if ('primary_clinician_id' in body) {

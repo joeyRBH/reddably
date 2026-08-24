@@ -29,7 +29,14 @@ const {
   sessionHasActiveClaim,
   insertDraftClaim,
 } = require('../lib/claims');
-const { PLACE_OF_SERVICE_CODES, isValidPlaceOfService } = require('../lib/place_of_service');
+const {
+  cleanText,
+  parseMoney,
+  parseProcedureModifiers,
+  parsePlaceOfService,
+  placeOfServiceError,
+  applyClientDefaults,
+} = require('../lib/billing_fields');
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -47,10 +54,6 @@ const RECURRENCE_CADENCES = ['none', 'weekly', 'biweekly'];
 const RECURRENCE_MAX_MONTHS = 6;
 
 const MAX_DIAGNOSIS_CODES = 12; // CMS-1500 allows up to 12 ICD-10 codes.
-const MAX_PROCEDURE_MODIFIERS = 4; // CMS-1500 Box 24D holds up to 4 modifiers per line.
-
-// A procedure modifier (post-normalization) is exactly two alphanumeric characters.
-const MODIFIER_RE = /^[A-Z0-9]{2}$/;
 
 // --- request helpers ---------------------------------------------------------
 
@@ -71,12 +74,6 @@ function queryParam(event, name) {
 
 // --- validation helpers ------------------------------------------------------
 
-function cleanText(v) {
-  if (v == null) return null;
-  const s = String(v).trim();
-  return s === '' ? null : s;
-}
-
 function isUUID(v) {
   return typeof v === 'string' && UUID_RE.test(v.trim());
 }
@@ -87,13 +84,12 @@ function isValidDate(s) {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 
-// Optional money: absent/blank → null; otherwise a finite number >= 0.
-function parseMoney(v) {
-  if (v == null || v === '') return { ok: true, value: null };
-  const n = Number(v);
-  if (!Number.isFinite(n) || n < 0) return { ok: false };
-  return { ok: true, value: n };
-}
+// parseMoney / parseProcedureModifiers / parsePlaceOfService / placeOfServiceError
+// live in lib/billing_fields.js (imported above): clients now hold per-client
+// DEFAULTS for the same fields, so the same values are validated on two routes
+// and a second copy here would be a second, divergent definition of what a
+// valid place of service or procedure modifier is. The three parsers below
+// stay local — nothing outside a session validates them.
 
 // Optional positive integer minutes: absent/blank → null; otherwise integer >= 1.
 function parseDuration(v) {
@@ -103,6 +99,7 @@ function parseDuration(v) {
   return { ok: true, value: n };
 }
 
+
 // Optional session status: absent/blank → null (caller applies default);
 // otherwise must be one of the allowed enum values.
 function parseStatus(v) {
@@ -110,6 +107,7 @@ function parseStatus(v) {
   if (typeof v !== 'string' || !SESSION_STATUSES.includes(v)) return { ok: false };
   return { ok: true, value: v };
 }
+
 
 // Optional ICD-10 diagnosis codes: absent/null → null; otherwise must be an
 // array of non-empty trimmed strings, at most MAX_DIAGNOSIS_CODES. An empty
@@ -126,51 +124,6 @@ function parseDiagnosisCodes(v) {
   }
   if (out.length > MAX_DIAGNOSIS_CODES) return { ok: false };
   return { ok: true, value: out.length === 0 ? null : out };
-}
-
-// Optional procedure modifiers (CMS-1500 Box 24D / 837P service line): absent/null
-// → null; otherwise must be an array. Each entry is trimmed and uppercased; blanks
-// are dropped; every surviving entry must be exactly two alphanumeric characters
-// (anything else is a hard 400, not a silent drop). The cleaned list is
-// de-duplicated preserving first-seen order and capped at MAX_PROCEDURE_MODIFIERS —
-// more than four DISTINCT modifiers is a 400, never a truncation. An empty / all-
-// blank array clears the column (stored as null). This normalization is mirrored by
-// normalizeProcedureModifiers() in lib/clearinghouse/stedi.js so what is validated
-// here is exactly what rides the 837P.
-function parseProcedureModifiers(v) {
-  if (v == null) return { ok: true, value: null };
-  if (!Array.isArray(v)) return { ok: false };
-  const out = [];
-  const seen = new Set();
-  for (const item of v) {
-    if (typeof item !== 'string') return { ok: false };
-    const code = item.trim().toUpperCase();
-    if (code === '') continue;                  // drop blanks
-    if (!MODIFIER_RE.test(code)) return { ok: false };
-    if (seen.has(code)) continue;               // de-duplicate, preserve order
-    seen.add(code);
-    out.push(code);
-  }
-  if (out.length > MAX_PROCEDURE_MODIFIERS) return { ok: false };
-  return { ok: true, value: out.length === 0 ? null : out };
-}
-
-// Optional place of service (837P 2300/CLM05-01 / CMS-1500 Box 24B): absent/blank
-// → null (a session may be saved before billing details are known — exactly what
-// calendar-promoted sessions do). Otherwise the trimmed value must be one of the
-// two-character CMS codes in lib/place_of_service.js — a free-text value like
-// "office" is what got a live claim rejected by the payer ("CLM-05-01 cannot
-// exceed 2 characters").
-function parsePlaceOfService(v) {
-  const s = cleanText(v);
-  if (s == null) return { ok: true, value: null };
-  if (!isValidPlaceOfService(s)) return { ok: false };
-  return { ok: true, value: s };
-}
-
-function placeOfServiceError() {
-  const allowed = PLACE_OF_SERVICE_CODES.map((e) => `${e.code} (${e.label})`).join(', ');
-  return `Invalid place_of_service. Expected one of: ${allowed}.`;
 }
 
 // --- shaping -----------------------------------------------------------------
@@ -209,12 +162,16 @@ async function loadPracticeId(userId) {
 }
 
 // True if clientId is a non-hidden client within this practice.
+// The client row when clientId is a visible client of this practice, else null.
+// Returns the ROW rather than a boolean so create paths can seed a new session
+// from the client's billing defaults without a second query; every caller uses
+// it in boolean position, where a row is truthy and null is falsy.
 async function clientInPractice(practiceId, clientId) {
   const res = await db.query(
-    `select 1 from clients where id = $1 and practice_id = $2 and is_hidden = false limit 1`,
+    `select * from clients where id = $1 and practice_id = $2 and is_hidden = false limit 1`,
     [clientId, practiceId]
   );
-  return res.rowCount > 0;
+  return res.rows[0] || null;
 }
 
 // True if clinicianId is an active user within this practice.
@@ -250,7 +207,8 @@ async function createSession(practiceId, body, event, authCtx) {
   if (!isValidDate(sessionDate)) {
     return json(400, { error: 'Invalid session_date. Expected YYYY-MM-DD.' }, event);
   }
-  if (!(await clientInPractice(practiceId, clientId))) {
+  const client = await clientInPractice(practiceId, clientId);
+  if (!client) {
     return json(400, { error: 'client_id is not a client in this practice.' }, event);
   }
   if (!(await clinicianInPractice(practiceId, clinicianId))) {
@@ -293,8 +251,22 @@ async function createSession(practiceId, body, event, authCtx) {
   if (!pos.ok) {
     return json(400, { error: placeOfServiceError() }, event);
   }
-  const placeOfService = pos.value;
   const notes = cleanText(body.notes);
+
+  // Per-client billing defaults fill in whatever the caller left blank, so a
+  // session created from the chart arrives billable rather than empty. Anything
+  // actually supplied wins. Validation has already run on the supplied values
+  // above; the stored defaults were validated on the way INTO the clients row by
+  // the same parsers (backend/handlers/clients.js imports them from the same
+  // module), so nothing unvalidated can reach a session through this path.
+  const seeded = applyClientDefaults({
+    cpt_code: cptCode,
+    place_of_service: pos.value,
+    fee: fee.value,
+    procedure_modifiers: modifiers.value,
+    diagnosis_codes: dx.value,
+  }, client);
+  const placeOfService = seeded.place_of_service;
 
   if (recurrence === 'none') {
     const res = await db.query(
@@ -309,11 +281,11 @@ async function createSession(practiceId, body, event, authCtx) {
         clinicianId,
         sessionDate,
         duration.value,
-        cptCode,
-        dx.value,
+        seeded.cpt_code,
+        seeded.diagnosis_codes,
         placeOfService,
-        modifiers.value,
-        fee.value,
+        seeded.procedure_modifiers,
+        seeded.fee,
         notes,
         status.value,
       ]
@@ -363,11 +335,11 @@ async function createSession(practiceId, body, event, authCtx) {
           clinicianId,
           dates[i],
           duration.value,
-          cptCode,
-          dx.value,
+          seeded.cpt_code,
+          seeded.diagnosis_codes,
           placeOfService,
-          modifiers.value,
-          fee.value,
+          seeded.procedure_modifiers,
+          seeded.fee,
           notes,
           rowStatus,
           groupId,

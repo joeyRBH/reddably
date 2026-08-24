@@ -255,6 +255,14 @@ create table if not exists clients (
   postal_code          text,
   country              text not null default 'US',
   diagnosis_codes      text[],                                -- default ICD-10 dx (dotless, billable) auto-applied to new sessions
+  -- Per-client billing defaults seeded onto every new session (calendar promote
+  -- + manual create), so a promoted appointment arrives billable instead of
+  -- blank. Per-session override always wins. See §021 migration.
+  default_cpt_code             text,
+  default_place_of_service     text,                          -- 2-char CMS code; validated on write
+  default_session_fee          numeric(12,2),
+  default_procedure_modifiers  text[],                        -- CMS-1500 Box 24D (e.g. {95})
+  calendar_display_name        text,                          -- PHI: name used in EHR calendar titles, for the matcher
   status               text not null default 'awaiting_info'
                          check (status in ('active', 'awaiting_info', 'inactive')),  -- 'active' == ready for claim submission
   is_hidden            boolean not null default false,
@@ -313,6 +321,26 @@ alter table clients add column if not exists payment_link_sent_at timestamptz;
 -- Stored dotless (F3290), billable-specificity only. See
 -- db/migrations/008_add_diagnosis_codes_to_clients.sql.
 alter table clients add column if not exists diagnosis_codes text[];
+
+-- Migration (idempotent): per-client billing defaults + the EHR calendar display
+-- name. A calendar-promoted appointment used to insert a session with cpt_code,
+-- place_of_service, fee and procedure_modifiers all NULL, so every promoted
+-- session still needed billing data typed in by hand before it could become a
+-- claim — the integration saved the scheduling step but none of the billing one.
+-- These add four further per-client default fields, analogous to the diagnosis
+-- default that has existed since migration 008 — each holds its own value, none
+-- derives from diagnosis_codes. That column keeps its name rather than being
+-- renamed for symmetry; backend/lib/billing_fields.js maps the two styles in one
+-- place.
+-- calendar_display_name is PHI — the name the practice's EHR writes into event
+-- titles — used only as one extra comparison form by the calendar matcher.
+-- Declared above for fresh databases; these keep a pre-existing database in
+-- sync. See db/migrations/021_add_client_billing_defaults.sql.
+alter table clients add column if not exists default_cpt_code text;
+alter table clients add column if not exists default_place_of_service text;
+alter table clients add column if not exists default_session_fee numeric(12,2);
+alter table clients add column if not exists default_procedure_modifiers text[];
+alter table clients add column if not exists calendar_display_name text;
 
 -- Migration (idempotent): retire the unused 'ready' client status. The allowed
 -- set is now exactly active / awaiting_info / inactive, where 'active' already
