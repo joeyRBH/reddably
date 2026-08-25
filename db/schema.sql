@@ -624,6 +624,47 @@ create index if not exists idx_claims_corrects_claim_id on claims (corrects_clai
 alter table claims add column if not exists prior_authorization_number text;
 
 -- =============================================================================
+-- 8a. claim_sessions — the service lines of a claim (one row per session).
+-- =============================================================================
+-- A claim was strictly 1:1 with a session until this table, and the 837P builder
+-- emitted exactly one service line from it — so a client with ten sessions in a
+-- month produced ten claims and ten separate platform-fee charges on their card
+-- statement, for what is to them one month of therapy. A CMS-1500 has always
+-- carried several dates of service (Box 24 holds six service lines, each with
+-- its own date, procedure code and charge); this is that relationship.
+--
+-- claims.session_id STAYS and is the ANCHOR session (the earliest on the claim),
+-- so every pre-existing join, readiness query and report keeps working. This
+-- table adds a relationship rather than moving one.
+--
+-- The platform fee follows for free: it is 5% of claims.billed_amount, and a
+-- grouped claim's billed_amount is the SUM of its line charges. Same total
+-- dollars, one charge instead of N.
+-- See db/migrations/022_add_claim_sessions.sql (includes the backfill).
+create table if not exists claim_sessions (
+  id           uuid primary key default gen_random_uuid(),
+  practice_id  uuid not null references practices (id) on delete restrict,
+  claim_id     uuid not null references claims (id) on delete cascade,   -- like claim_events: no meaning without its claim
+  session_id   uuid not null references sessions (id) on delete restrict, -- the session is a record in its own right
+  line_charge  numeric(12,2),                                            -- 837P SV102 / Box 24F; the claim charge is the SUM of these
+  position     integer not null default 1,                               -- stable service-line order
+  created_at   timestamptz not null default now(),
+  unique (claim_id, session_id)   -- a session may ride several claims (replacement), never one claim twice
+);
+comment on table claim_sessions is 'Service lines of a claim: one row per session billed on it (837P 2400 / CMS-1500 Box 24). claims.session_id remains the anchor (earliest) session.';
+
+create index if not exists idx_claim_sessions_practice_id on claim_sessions (practice_id);
+create index if not exists idx_claim_sessions_claim_id on claim_sessions (claim_id);
+create index if not exists idx_claim_sessions_session_id on claim_sessions (session_id);
+
+-- Backfill (idempotent): every pre-existing claim becomes a one-line claim over
+-- its own session, so there is ONE code path rather than "grouped" and "old".
+insert into claim_sessions (practice_id, claim_id, session_id, line_charge, position)
+select c.practice_id, c.id, c.session_id, c.billed_amount, 1
+  from claims c
+ where not exists (select 1 from claim_sessions cs where cs.claim_id = c.id);
+
+-- =============================================================================
 -- 9. claim_events — status-history log per claim.
 --    Events belong to the claim's lifecycle, so ON DELETE CASCADE.
 -- =============================================================================

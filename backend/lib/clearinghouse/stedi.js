@@ -424,7 +424,30 @@ function buildSubmissionBody(ctx) {
   const client = (ctx && ctx.client) || {};
   const clinician = (ctx && ctx.clinician) || {};
   const practice = (ctx && ctx.practice) || {};
+  // The ANCHOR session. Claim-LEVEL fields (place of service, the diagnosis set)
+  // are read from it, because the 837P carries exactly one of each per claim —
+  // which is precisely why grouping refuses to combine claims that disagree about
+  // them (see lib/claim_grouping.js).
   const session = (ctx && ctx.session) || {};
+  // Every session billed on this claim, in filing order — one 837P service line
+  // each. A 1:1 claim is a one-line claim, so there is no separate code path.
+  const billableSessions = (ctx && Array.isArray(ctx.sessions) && ctx.sessions.length)
+    ? ctx.sessions
+    : [session];
+
+  // The charge FILED for one line. claim_sessions.line_charge is authoritative:
+  // it was copied from the session fee when the line was created, so editing the
+  // session afterwards cannot make the filed lines stop summing to the filed
+  // claim total. Falling back to the session fee, and then to the claim total,
+  // keeps a single-line claim building exactly as it did before service lines
+  // existed.
+  function lineChargeOf(s) {
+    if (s && s.line_charge != null) return s.line_charge;
+    if (billableSessions.length === 1) {
+      return claim.billed_amount != null ? claim.billed_amount : (s && s.fee);
+    }
+    return s && s.fee != null ? s.fee : null;
+  }
 
   const tradingPartnerServiceId = insurance.payer_id;
   if (!tradingPartnerServiceId) {
@@ -480,46 +503,81 @@ function buildSubmissionBody(ctx) {
       : [{ diagnosisTypeCode: 'ABK', diagnosisCode: 'F329' }],
   };
 
-  // Only attach a service line when we have a CPT code; otherwise omit serviceLines.
-  // Note: no line-item control number (REF*6R) is sent — nothing here is UUID-based,
-  // so there is no >20-char value to bound. If one is ever added, route it through
-  // boundControlNumber() so it stays within the 20-char limit like the CLM01 above.
-  if (session.cpt_code) {
-    const pointerCount = Math.min(
-      Math.max(diagnoses.length, 1),
-      MAX_LINE_DIAGNOSIS_POINTERS
-    );
-    const lineDiagnosisPointers = Array.from({ length: pointerCount }, (_, i) => String(i + 1));
-    const professionalService = {
-      procedureIdentifier: 'HC',
-      procedureCode: session.cpt_code,
-      lineItemChargeAmount: claim.billed_amount != null ? String(claim.billed_amount) : undefined,
-      measurementUnit: 'UN',     // units of service
-      serviceUnitCount: '1',     // one unit per claim line (standard for OON psychotherapy CPT codes)
-      // Point this line at the first N diagnoses declared above, in stored
-      // order, 1-indexed. N is capped by the LINE limit (4), which is smaller
-      // than the claim limit (12) — emitting one pointer per claim diagnosis
-      // would overflow SV107. With no stored diagnoses this is ['1'], the
-      // placeholder principal.
-      compositeDiagnosisCodePointers: { diagnosisCodePointers: lineDiagnosisPointers },
-    };
+  // Service lines — ONE PER SESSION on the claim (837P loop 2400 / CMS-1500 Box
+  // 24). ctx.sessions is the claim's service lines in filing order; a 1:1 claim
+  // is simply a one-line claim, so there is no "grouped" branch here.
+  //
+  // Each line carries its OWN date of service and its OWN charge. The charge
+  // comes from the stored line charge (claim_sessions.line_charge), not from the
+  // session's current fee, so an edit to the session after filing cannot make the
+  // lines stop adding up.
+  //
+  // Note: no line-item control number (REF*6R) is sent — nothing here is
+  // UUID-based, so there is no >20-char value to bound. If one is ever added,
+  // route it through boundControlNumber() so it stays within the 20-char limit
+  // like the CLM01 above.
+  const pointerCount = Math.min(
+    Math.max(diagnoses.length, 1),
+    MAX_LINE_DIAGNOSIS_POINTERS
+  );
+  const lineDiagnosisPointers = Array.from({ length: pointerCount }, (_, i) => String(i + 1));
 
-    // Procedure modifiers (Box 24D / SV101-3..6) — e.g. 95 for synchronous
-    // telehealth, paired with the telehealth place of service above. The session
-    // decides; omit the field ENTIRELY when there are none (never '' / null / []).
-    // procedureModifiers is an array of strings on professionalService, confirmed
-    // against Stedi's live schema via the negative-control probe (see the PR).
-    const procedureModifiers = normalizeProcedureModifiers(session.procedure_modifiers);
-    if (procedureModifiers.length) {
-      professionalService.procedureModifiers = procedureModifiers;
-    }
+  const serviceLines = billableSessions
+    .filter((s) => s && s.cpt_code)
+    .map((s) => {
+      const professionalService = {
+        procedureIdentifier: 'HC',
+        procedureCode: s.cpt_code,
+        lineItemChargeAmount: lineChargeOf(s) != null ? String(lineChargeOf(s)) : undefined,
+        measurementUnit: 'UN',     // units of service
+        serviceUnitCount: '1',     // one unit per line (standard for OON psychotherapy CPT codes)
+        // Point this line at the first N diagnoses declared above, in stored
+        // order, 1-indexed. N is capped by the LINE limit (4), which is smaller
+        // than the claim limit (12) — emitting one pointer per claim diagnosis
+        // would overflow SV107. With no stored diagnoses this is ['1'], the
+        // placeholder principal.
+        compositeDiagnosisCodePointers: { diagnosisCodePointers: lineDiagnosisPointers },
+      };
 
-    claimInformation.serviceLines = [
-      {
-        serviceDate: ymd(session.session_date) || undefined,
+      // Procedure modifiers (Box 24D / SV101-3..6) — e.g. 95 for synchronous
+      // telehealth, paired with the telehealth place of service above. The
+      // session decides; omit the field ENTIRELY when there are none (never
+      // '' / null / []). procedureModifiers is an array of strings on
+      // professionalService, confirmed against Stedi's live schema via the
+      // negative-control probe (see the PR).
+      const procedureModifiers = normalizeProcedureModifiers(s.procedure_modifiers);
+      if (procedureModifiers.length) {
+        professionalService.procedureModifiers = procedureModifiers;
+      }
+
+      return {
+        serviceDate: ymd(s.session_date) || undefined,
         professionalService,
-      },
-    ];
+      };
+    });
+
+  if (serviceLines.length) {
+    claimInformation.serviceLines = serviceLines;
+
+    // THE LINE-SUM INVARIANT. A payer rejects an 837P whose service lines do not
+    // add up to the claim charge, and that rejection arrives days later against a
+    // real filing. Assert it HERE, while the claim is still a draft in our own
+    // process, rather than discovering it downstream. Compared in whole cents so
+    // binary floating point cannot manufacture a false mismatch.
+    const lineTotalCents = serviceLines.reduce((sum, line) => {
+      const amt = Number(line.professionalService.lineItemChargeAmount);
+      return sum + (Number.isFinite(amt) ? Math.round(amt * 100) : 0);
+    }, 0);
+    const claimTotalCents = claim.billed_amount != null
+      ? Math.round(Number(claim.billed_amount) * 100)
+      : null;
+    if (claimTotalCents != null && lineTotalCents !== claimTotalCents) {
+      throw new Error(
+        'Claim charge does not equal the sum of its service lines ' +
+        `(claim ${claimTotalCents / 100}, lines ${lineTotalCents / 100}). ` +
+        'Refusing to build: the payer would reject this filing. Regenerate the claim.'
+      );
+    }
   }
 
   // Replacement claim (CMS frequency 7): override the default original ('1') and

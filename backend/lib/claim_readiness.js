@@ -410,6 +410,27 @@ const READINESS_STATES = ['needs_correction', 'review_warning', 'ready_to_review
 // guess): the replacement gates on the payer claim number, the replaced claim's
 // accepted state, and prior replacements of the same original. A replacement
 // claim is surfaced as a review warning; its gates stay submit-time.
+// The service lines to validate. A claim carries one line per session billed on
+// it; ctx.sessions is that list, and ctx.session (the anchor) is the fallback for
+// any caller that has not been taught about lines yet. EVERY line is validated —
+// a grouped claim whose second date of service has no CPT code is just as
+// unfilable as one whose first does not, and the failure would surface at the
+// payer rather than here.
+function sessionsOf(ctx) {
+  if (ctx && Array.isArray(ctx.sessions) && ctx.sessions.length) return ctx.sessions;
+  return (ctx && ctx.session) ? [ctx.session] : [];
+}
+
+// Name a service line by its date, so a blocker on a grouped claim says WHICH
+// date of service is wrong instead of leaving the user to guess. Silent for a
+// single-line claim, where there is nothing to disambiguate. Dates of service are
+// PHI-adjacent but already present throughout the claims UI; no name, no code.
+function lineLabel(sessions, session) {
+  if (!sessions || sessions.length < 2) return '';
+  const d = session && session.session_date;
+  return d ? ` (service date ${String(d).slice(0, 10)})` : '';
+}
+
 function evaluateClaimReadiness(ctx, asOf) {
   const claim = (ctx && ctx.claim) || null;
   const blockers = [];
@@ -426,23 +447,32 @@ function evaluateClaimReadiness(ctx, asOf) {
   if (missingDependentPolicyholderField(ctx && ctx.insurance)) {
     blockers.push(blocker('dependent_policyholder', BLOCKER_MESSAGES.dependent_policyholder));
   }
-  if (invalidSessionPlaceOfService(ctx && ctx.session) != null) {
-    blockers.push(blocker('session_place_of_service', placeOfServiceBlockerMessage()));
-  }
+  const sessions = sessionsOf(ctx);
+  sessions.forEach((session) => {
+    if (invalidSessionPlaceOfService(session) != null) {
+      blockers.push(blocker('session_place_of_service',
+        placeOfServiceBlockerMessage() + lineLabel(sessions, session)));
+    }
+  });
   // Billable content — what the claim actually charges for. Appended AFTER the
   // setup/demographic blockers, in submit's order.
   if (missingBilledAmount(claim)) {
     blockers.push(blocker('claim_billed_amount', BLOCKER_MESSAGES.claim_billed_amount));
   }
-  if (missingSessionCptCode(ctx && ctx.session)) {
-    blockers.push(blocker('session_cpt_code', BLOCKER_MESSAGES.session_cpt_code));
-  }
-  if (missingDiagnosisCodes(ctx && ctx.session)) {
-    blockers.push(blocker('claim_diagnosis_codes', BLOCKER_MESSAGES.claim_diagnosis_codes));
-  }
-  if (excessDiagnosisCodes(ctx && ctx.session) != null) {
-    blockers.push(blocker('claim_diagnosis_limit', BLOCKER_MESSAGES.claim_diagnosis_limit));
-  }
+  sessions.forEach((session) => {
+    if (missingSessionCptCode(session)) {
+      blockers.push(blocker('session_cpt_code',
+        BLOCKER_MESSAGES.session_cpt_code + lineLabel(sessions, session)));
+    }
+    if (missingDiagnosisCodes(session)) {
+      blockers.push(blocker('claim_diagnosis_codes',
+        BLOCKER_MESSAGES.claim_diagnosis_codes + lineLabel(sessions, session)));
+    }
+    if (excessDiagnosisCodes(session) != null) {
+      blockers.push(blocker('claim_diagnosis_limit',
+        BLOCKER_MESSAGES.claim_diagnosis_limit + lineLabel(sessions, session)));
+    }
+  });
   // Coverage that is NAMED but gone, then the payer id on coverage that resolved.
   // Adjacent and in this order because an unresolvable record makes the payer-id
   // question moot — and because either one, unblocked, reaches the same local
@@ -467,6 +497,7 @@ function evaluateClaimReadiness(ctx, asOf) {
 }
 
 module.exports = {
+  sessionsOf,
   // hard blockers (pure)
   missingInsuranceRecord,
   missingBillingAddressField,

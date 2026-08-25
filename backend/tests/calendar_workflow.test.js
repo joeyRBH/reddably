@@ -416,7 +416,7 @@ assert.strictEqual(bustOf('./views/calendar.js'), '20260728c',
 // claims.js has since been re-bumped by the per-client billing defaults change
 // (the Edit-claim form gained the "save as defaults" control). Still pinned, so
 // that an unintended bump is still caught — just at its current value.
-assert.strictEqual(bustOf('./views/claims.js'), '20260824a',
+assert.strictEqual(bustOf('./views/claims.js'), '20260824b',
   'the Claims cache-buster is at its current value');
 
 console.log('PASS calendar_workflow.test.js');
